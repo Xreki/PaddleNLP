@@ -133,8 +133,8 @@ class ModelArguments:
         metadata={"help": "llama, use_fused_rms_norm"},
     )
     fuse_attention_qkv: bool = field(
-        default=True,
-        metadata={"help": "gpt, fuse_attention_qkv"},
+        default=False,
+        metadata={"help": "whether to fuse attention qkv"},
     )
     recompute_granularity: str = field(
         default="full",
