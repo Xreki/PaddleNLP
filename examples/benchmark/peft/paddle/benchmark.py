@@ -15,8 +15,9 @@
 from dataclasses import dataclass, field
 from typing import Optional
 
+import paddle.profiler as profiler
 from datasets import load_dataset
-from utils import CustomTrainer
+from utils import CustomTrainer, ProfilerCallback
 
 from paddlenlp.data import DataCollatorForSeq2Seq
 from paddlenlp.peft import LoRAConfig, LoRAModel
@@ -57,6 +58,8 @@ class ModelArguments:
     model_name_or_path: str = field(default=None, metadata={"help": "model name or local path"})
     lora: Optional[bool] = field(default=False, metadata={"help": "whether to use LoRA"})
     english: Optional[bool] = field(default=False, metadata={"help": "whether to english benchmark dataset"})
+    profiler: Optional[bool] = field(default=False, metadata={"help": "whether to use profiler"})
+    train_data_size: int = field(default=1000, metadata={"help": "Number of dataset for training"})
 
 
 def main():
@@ -70,11 +73,12 @@ def main():
             dtype = "float16"
         if training_args.bf16:
             dtype = "bfloat16"
+    else:
+        dtype = "float32"
 
     tokenizer = AutoTokenizer.from_pretrained(model_args.model_name_or_path)
     if "llama" in model_args.model_name_or_path:
         tokenizer.pad_token = tokenizer.unk_token
-
     model = AutoModelForCausalLM.from_pretrained(
         model_args.model_name_or_path,
         load_state_as_np=True,
@@ -119,19 +123,33 @@ def main():
         dataset = load_dataset("tatsu-lab/alpaca")
     else:
         dataset = load_dataset("Chinese-Vicuna/guanaco_belle_merge_v1.0")
+
     # select first 10k examples for benchmarking
-    dataset = dataset["train"].select(range(10000))
+    dataset = dataset["train"].select(range(model_args.train_data_size))
     dataset = dataset.map(
         lambda example: preprocess_function(example), remove_columns=["instruction", "input", "output"]
     )
     total_effective_tokens = sum([len(i["input_ids"]) for i in dataset]) * training_args.num_train_epochs
 
+    if model_args.profiler:
+        prof = profiler.Profiler(
+            targets=[profiler.ProfilerTarget.CPU, profiler.ProfilerTarget.GPU],
+            profile_memory=True,
+            scheduler=profiler.make_scheduler(closed=1, ready=2, record=1, repeat=1),
+            on_trace_ready=profiler.export_chrome_tracing("./log"),
+        )
+
+    data_collator = DataCollatorForSeq2Seq(return_tensors="pd", tokenizer=tokenizer)
+
     trainer = CustomTrainer(
         model=model,
+        tokenizer=tokenizer,
         train_dataset=dataset,
+        callbacks=[ProfilerCallback(prof)] if model_args.profiler else [],
         args=training_args,
-        data_collator=DataCollatorForSeq2Seq(return_tensors="pd", tokenizer=tokenizer),
+        data_collator=data_collator,
     )
+
     train_metrics = trainer.train()
     tokens_per_second = trainer.total_observed_tokens / train_metrics.metrics["train_runtime"]
     effective_tokens_per_second = total_effective_tokens / train_metrics.metrics["train_runtime"]
