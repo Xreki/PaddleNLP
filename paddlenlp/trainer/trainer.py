@@ -36,6 +36,7 @@ import paddle
 import paddle.amp.auto_cast as autocast
 import paddle.distributed as dist
 import paddle.nn as nn
+import paddle.profiler as profiler
 from packaging import version
 from paddle.distributed import fleet
 from paddle.distributed.fleet.meta_optimizers.dygraph_optimizer import (
@@ -45,10 +46,12 @@ from paddle.distributed.fleet.utils.hybrid_parallel_util import (
     fused_allreduce_gradients,
 )
 from paddle.io import DataLoader, Dataset, DistributedBatchSampler
+from paperf import profile_paddle
 from tqdm.auto import tqdm
 
 from ..data import DataCollator, DataCollatorWithPadding, default_data_collator
 from ..peft import LoRAModel, PrefixModelForCausalLM
+from ..transformers.llama.modeling import LlamaRotaryEmbedding
 from ..transformers.model_utils import (
     PretrainedModel,
     _add_variant,
@@ -298,9 +301,17 @@ class Trainer:
             if self.args.fp16_opt_level == "O2":
                 if self.amp_dtype == "bfloat16":
                     # fix for paddlepaddle < 2.4.1, not support for bf16
-                    paddle.amp.decorate(models=model, level=self.args.fp16_opt_level, dtype=self.amp_dtype)
+                    paddle.amp.decorate(
+                        models=model,
+                        level=self.args.fp16_opt_level,
+                        dtype=self.amp_dtype,
+                        excluded_layers=[LlamaRotaryEmbedding],
+                    )
                 else:
-                    paddle.amp.decorate(models=model, level=self.args.fp16_opt_level)
+                    paddle.amp.decorate(
+                        models=model, level=self.args.fp16_opt_level, excluded_layers=[LlamaRotaryEmbedding]
+                    )
+
             # for pipeline mode and pure tensor parallel
             if self.args.pipeline_parallel_degree > 1 or (
                 self.args.tensor_parallel_degree > 1 and self.sharding is None
@@ -644,6 +655,11 @@ class Trainer:
 
             npu_accelerate_plugin(self.optimizer)
 
+        #        print(model)
+        #        profile_paddle.register_profile_hook(model)
+
+        prof = profiler.Profiler(scheduler=[10, 15], timer_only=True)
+        prof.start()
         for epoch in range(epochs_trained, num_train_epochs):
             if isinstance(train_dataloader, paddle.io.DataLoader) and isinstance(
                 train_dataloader.batch_sampler, DistributedBatchSampler
@@ -681,6 +697,9 @@ class Trainer:
                     steps_trained_progress_bar = None
 
                 if step % args.gradient_accumulation_steps == 0:
+                    if self.state.global_step == 10:
+                        paddle.device.cuda.synchronize()
+                    #                    profile_paddle.switch_profile(self.state.global_step, 10, 12, enable_layerwise_event=True)
                     self.control = self.callback_handler.on_step_begin(args, self.state, self.control)
 
                 dp_enabled = (
@@ -725,6 +744,7 @@ class Trainer:
                     # Case 1: Use sharding stage 2/3 with dp
                     # Case 2: Use recompute and dp
                     # local_rank != -1 don't means dp in networks.
+                    profile_paddle.push_record_event("fused_allreduce_gradients")
                     if self.sharding and ShardingOption.SHARD_OP not in self.args.sharding:
                         if self.args.data_parallel_degree > 1 and not is_dp_group_support_in_group_sharded_parallel():
                             fused_allreduce_gradients(model.parameters(), fleet.get_hybrid_communicate_group())
@@ -741,6 +761,7 @@ class Trainer:
                     # manualy collect gradient for dp.
                     elif args.recompute and availiable_no_sync:
                         fused_allreduce_gradients(list(model.parameters()), None)
+                    profile_paddle.pop_record_event()
 
                     # pipeline parallel mode,  handle gradient merge here
                     if args.pipeline_parallel_degree > 1 and getattr(model, "_delay_scale_loss", False):
@@ -751,6 +772,7 @@ class Trainer:
                             elif p.grad is not None:
                                 p.grad = p.grad.scale(1.0 / self.args.gradient_accumulation_steps)
 
+                    profile_paddle.push_record_event("optimizer")
                     # Optimizer step
                     self.callback_handler.on_optimizer_begin(
                         args, self.state, self.control, scaler=self.scaler if self.do_grad_scaling else None
@@ -768,20 +790,40 @@ class Trainer:
                             )
                     else:
                         self.optimizer.step()
+                    profile_paddle.pop_record_event()
 
+                    profile_paddle.push_record_event("lr_scheduler")
                     if optimizer_was_run:
                         self.lr_scheduler.step()
+                    profile_paddle.pop_record_event()
 
+                    profile_paddle.push_record_event("clear_grad")
                     self.optimizer.clear_grad()
+                    profile_paddle.pop_record_event()
+                    profile_paddle.push_record_event("on_optimizer_end")
                     self.callback_handler.on_optimizer_end(
                         args, self.state, self.control, scaler=self.scaler if self.do_grad_scaling else None
                     )
+                    profile_paddle.pop_record_event()
 
                     self.state.global_step += 1
                     self.state.epoch = epoch + (step + 1) / steps_in_epoch
 
+                    profile_paddle.push_record_event("on_step_end")
                     self.control = self.callback_handler.on_step_end(args, self.state, self.control)
+                    profile_paddle.pop_record_event()
+                    profile_paddle.push_record_event("log_save")
                     self._maybe_log_save_evaluate(tr_loss, model, epoch, ignore_keys_for_eval, inputs=inputs)
+                    profile_paddle.pop_record_event()
+
+                    prof.step()
+                    #                    print(f"[BENCHMARK][{step}/{self.state.global_step}] {prof.step_info()}")
+                    if self.state.global_step == 30:
+                        prof.stop()
+                        prof.summary(op_detail=True)
+                        exit()
+                #                    import sys
+                #                    sys.exit()
                 else:
                     self.control = self.callback_handler.on_substep_end(args, self.state, self.control)
 
@@ -1279,15 +1321,23 @@ class Trainer:
 
         # Mixed precision training
         if training and self.do_grad_scaling:  # self.args.fp16_opt_level=="O2":
+
             # model, self.optimizer
             if self.amp_dtype == "bfloat16":
                 # fix for paddlepaddle < 2.4.1, not support for bf16
                 decorated = paddle.amp.decorate(
-                    models=model, optimizers=self.optimizer, level=self.args.fp16_opt_level, dtype=self.amp_dtype
+                    models=model,
+                    optimizers=self.optimizer,
+                    level=self.args.fp16_opt_level,
+                    dtype=self.amp_dtype,
+                    excluded_layers=[LlamaRotaryEmbedding],
                 )
             else:
                 decorated = paddle.amp.decorate(
-                    models=model, optimizers=self.optimizer, level=self.args.fp16_opt_level
+                    models=model,
+                    optimizers=self.optimizer,
+                    level=self.args.fp16_opt_level,
+                    excluded_layers=[LlamaRotaryEmbedding],
                 )
 
             if self.optimizer is None:
@@ -1539,16 +1589,20 @@ class Trainer:
         model.train()
         inputs = self._prepare_inputs(inputs)
 
+        profile_paddle.push_record_event("forward")
         with self.autocast_smart_context_manager():
             loss = self.compute_loss(model, inputs)
 
         if self.args.gradient_accumulation_steps > 1:
             loss = loss / self.args.gradient_accumulation_steps
+        profile_paddle.pop_record_event()
 
+        profile_paddle.push_record_event("backward")
         if self.do_grad_scaling:
             self.scaler.scale(loss).backward()
         else:
             loss.backward()
+        profile_paddle.pop_record_event()
 
         return loss.detach()
 
