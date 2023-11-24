@@ -21,13 +21,13 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 import paddle
+from utils import set_seed
 
 from paddlenlp.trainer import (
     PdArgumentParser,
     Trainer,
     TrainingArguments,
     get_last_checkpoint,
-    set_seed,
     speed_metrics,
 )
 from paddlenlp.transformers import (
