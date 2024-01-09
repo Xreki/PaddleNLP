@@ -70,6 +70,13 @@ from paddle.distributed.fleet.utils.hybrid_parallel_util import (
 from paddle.io import DataLoader, Dataset, DistributedBatchSampler
 from tqdm.auto import tqdm
 
+try:
+    from paperf import profile_paddle
+
+    enable_profile = False
+except:
+    enable_profile = False
+
 from ..data import (
     DataCollator,
     DataCollatorWithPadding,
@@ -820,6 +827,9 @@ class Trainer:
 
             npu_accelerate_plugin(self.optimizer)
 
+        # if enable_profile:
+        #    profile_paddle.register_profile_hook(model)
+
         self.timers and self.timers("read-data").start()
 
         for epoch in range(epochs_trained, num_train_epochs):
@@ -863,6 +873,8 @@ class Trainer:
                     steps_trained_progress_bar = None
 
                 if step_control % args.gradient_accumulation_steps == 0:
+                    if enable_profile:
+                        profile_paddle.switch_profile(self.state.global_step, 5, 7, enable_layerwise_event=True)
                     self.control = self.callback_handler.on_step_begin(args, self.state, self.control)
                     self.timers and self.timers("forward-backward").start()
 
@@ -912,6 +924,8 @@ class Trainer:
                     # Case 2: Hack dp with master_grad
                     # Case 3: Pipeline or sharding overlap
                     # local_rank != -1 don't means dp in networks.
+                    if enable_profile:
+                        profile_paddle.push_record_event("all-reduce")
                     self.timers and self.timers("all-reduce").start()
 
                     # Case 1: Use recompute and dp / sharding stage1,
@@ -942,8 +956,12 @@ class Trainer:
                             if self.optimizer._dp_enable or getattr(self.optimizer, "_sep_enable", False):
                                 fused_allreduce_gradients(list(parameters_list), self.optimizer._hcg)
 
+                    if enable_profile:
+                        profile_paddle.pop_record_event()
                     self.timers and self.timers("all-reduce").stop()
                     self.timers and self.timers("optimizer-step").start()
+                    if enable_profile:
+                        profile_paddle.push_record_event("optimizer-step")
 
                     if args.pipeline_parallel_degree > 1 and enable_delay_scale_loss:
                         for p in model._layers.parameters():
@@ -976,12 +994,18 @@ class Trainer:
                     else:
                         self.optimizer.step()
 
+                    if enable_profile:
+                        profile_paddle.pop_record_event()
                     self.timers and self.timers("optimizer-step").stop()
 
                     if optimizer_was_run:
                         self.lr_scheduler.step()
 
+                    if enable_profile:
+                        profile_paddle.push_record_event("clear-grad")
                     self.optimizer.clear_grad()
+                    if enable_profile:
+                        profile_paddle.pop_record_event()
                     self.callback_handler.on_optimizer_end(
                         args, self.state, self.control, scaler=self.scaler if self.do_grad_scaling else None
                     )
@@ -1161,12 +1185,15 @@ class Trainer:
                 self.args.train_batch_size * self.args.gradient_accumulation_steps * self.args.dataset_world_size
             )
             num_steps = self.state.global_step - self._globalstep_last_logged
+
+            seq_length = getattr(self.model.config, "seq_length", None) if hasattr(self.model, "config") else None
             logs.update(
                 speed_metrics(
                     "interval",
                     self._globalstep_last_start_time,
                     num_samples=total_train_batch_size * num_steps,
                     num_steps=num_steps,
+                    seq_length=seq_length,
                 )
             )
 
@@ -1903,16 +1930,22 @@ class Trainer:
         model.train()
         inputs = self._prepare_inputs(inputs)
 
+        if enable_profile:
+            profile_paddle.push_record_event("forward")
         with self.autocast_smart_context_manager():
             loss = self.compute_loss(model, inputs)
 
         if self.args.gradient_accumulation_steps > 1:
             loss = loss / self.args.gradient_accumulation_steps
-
+        if enable_profile:
+            profile_paddle.pop_record_event()
+            profile_paddle.push_record_event("backward")
         if self.do_grad_scaling:
             self.scaler.scale(loss).backward()
         else:
             loss.backward()
+        if enable_profile:
+            profile_paddle.pop_record_event()
 
         return loss.detach()
 

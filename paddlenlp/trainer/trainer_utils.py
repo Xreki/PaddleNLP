@@ -277,7 +277,7 @@ def total_processes_number(local_rank):
     return 1
 
 
-def speed_metrics(split, start_time, num_samples=None, num_steps=None):
+def speed_metrics(split, start_time, num_samples=None, num_steps=None, seq_length=None):
     """
     Measure and return speed performance metrics.
 
@@ -295,6 +295,8 @@ def speed_metrics(split, start_time, num_samples=None, num_steps=None):
     if num_samples is not None:
         samples_per_second = num_samples / runtime
         result[f"{split}_samples_per_second"] = samples_per_second
+        if seq_length is not None:
+            result[f"{split}_tokens_per_second"] = samples_per_second * seq_length
     if num_steps is not None:
         steps_per_second = num_steps / runtime
         result[f"{split}_steps_per_second"] = steps_per_second
