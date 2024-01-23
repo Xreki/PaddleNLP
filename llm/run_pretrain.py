@@ -46,6 +46,7 @@ from paddlenlp.transformers import (
 )
 from paddlenlp.utils.batch_sampler import DistributedBatchSampler
 from paddlenlp.utils.log import logger
+from paddlenlp.utils.transformer_engine_utils import TransformerEngineHelper
 
 
 def add_start_docstrings(*docstr):
@@ -79,6 +80,14 @@ class PreTrainingArguments(TrainingArguments):
     autotuner_benchmark: bool = field(
         default=False,
         metadata={"help": "Weather to run benchmark by autotuner. True for from_scratch and pad_max_length."},
+    )
+    transformer_engine_backend: str = field(
+        default=None,
+        metadata={"help": "gpt, whether to use transformer engine backend, [None, 'paddle', 'transformer_engine']"},
+    )
+    use_fp8: bool = field(
+        default=False,
+        metadata={"help": "gpt, whether to use fp8 training"},
     )
 
     def __post_init__(self):
@@ -204,6 +213,10 @@ class ModelArguments:
     recompute_use_reentrant: bool = field(
         default=False,
         metadata={"help": "recompute_use_reentrant"},
+    )
+    te_init_weight_path: str = field(
+        default=None,
+        metadata={"help": "path to initial weights for TE"},
     )
 
 
@@ -455,6 +468,14 @@ def main():
     config.tensor_parallel_degree = training_args.tensor_parallel_degree
     config.tensor_parallel_rank = training_args.tensor_parallel_rank
 
+    if training_args.transformer_engine_backend is not None:
+        assert training_args.transformer_engine_backend in [
+            "paddle",
+            "transformer_engine",
+        ], "Only support paddle and transformer_engine backend"
+    config.transformer_engine_backend = training_args.transformer_engine_backend
+    config.use_fp8 = training_args.use_fp8
+
     # Config for model using dropout, such as GPT.
     config.hidden_dropout_prob = model_args.hidden_dropout_prob
     config.attention_probs_dropout_prob = model_args.attention_probs_dropout_prob
@@ -552,6 +573,16 @@ def main():
         * data_args.max_seq_length
     )
 
+    checkpoint = None
+    if training_args.resume_from_checkpoint is not None:
+        checkpoint = training_args.resume_from_checkpoint
+    elif last_checkpoint is not None:
+        checkpoint = last_checkpoint
+
+    if checkpoint is None and model_args.te_init_weight_path is None:
+        logger.info("No checkpoint. Initializing model from scratch")
+        model.init_weights()
+
     trainer = PretrainingTrainer(
         model=model,
         args=training_args,
@@ -562,11 +593,14 @@ def main():
         tokenizer=tokenizer,
     )
 
-    checkpoint = None
-    if training_args.resume_from_checkpoint is not None:
-        checkpoint = training_args.resume_from_checkpoint
-    elif last_checkpoint is not None:
-        checkpoint = last_checkpoint
+    if model_args.te_init_weight_path is not None:
+        if checkpoint is not None:
+            raise ValueError(
+                "Please do not provide last_checkpoint and te_init_weight_path at the same time."
+                "To load TE initial weights, please clean up the output_dir and remove --resume_from_checkpoint."
+            )
+        logger.info(f"Loading TE initial weights from {model_args.te_init_weight_path}")
+        TransformerEngineHelper.reset_te_init_weights(trainer, model_args.te_init_weight_path)
 
     # Training
     if training_args.do_train:
