@@ -29,6 +29,7 @@ from paddlenlp.data.causal_dataset import (
 from paddlenlp.trainer import (
     PdArgumentParser,
     Trainer,
+    TrainerCallback,
     TrainingArguments,
     get_last_checkpoint,
     set_seed,
@@ -384,6 +385,27 @@ class PretrainingTrainer(Trainer):
         )
 
 
+class NvtxCallback(TrainerCallback):
+    def __init__(self):
+        super().__init__()
+        self._nodeid = int(os.getenv("SLURM_NODEID", default="0"))
+        self._enable_profile = int(os.environ.get("ENABLE_PROFILE", 0))
+        self._start_step = int(os.environ.get("PROFILE_START_STEP", 0))
+        self._stop_step = int(os.environ.get("PROFILE_STOP_STEP", 0))
+        self._emit_nvtx = int(os.environ.get("PROFILE_EMIT_NVTX", 0))
+        profile_node = int(os.environ.get("PROFILE_NODEID", 0))
+        if self._nodeid != profile_node:
+            self._enable_profile = 0
+        if self._enable_profile and self._emit_nvtx:
+            paddle.fluid.core.nvprof_enable_record_event()
+
+    def on_step_begin(self, args, state, control, logs=None, inputs=None, timer=None, **kwargs):
+        if self._enable_profile and state.global_step == self._start_step:
+            paddle.fluid.core.nvprof_start()
+        if self._enable_profile and (state.global_step == (self._stop_step + 1)):
+            paddle.fluid.core.nvprof_stop()
+
+
 def main():
     parser = PdArgumentParser((ModelArguments, DataArguments, PreTrainingArguments))
     # Support format as "args.json --arg1 value1 --arg2 value2.”
@@ -583,6 +605,8 @@ def main():
         logger.info("No checkpoint. Initializing model from scratch")
         model.init_weights()
 
+    callbacks = [NvtxCallback()]
+
     trainer = PretrainingTrainer(
         model=model,
         args=training_args,
@@ -591,6 +615,7 @@ def main():
         eval_dataset=eval_dataset if training_args.do_eval else None,
         optimizers=(None, lr_scheduler),
         tokenizer=tokenizer,
+        callbacks=callbacks,
     )
 
     if model_args.te_init_weight_path is not None:
