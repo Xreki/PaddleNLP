@@ -955,7 +955,12 @@ class LlamaDecoderLayerWithNVTEBackend(nn.Layer):
         super().__init__()
 
         self.config = config
+        RoPE = TransformerEngineHelper.get_rope_layer()
         TransformerLayer = TransformerEngineHelper.get_transformer_layer()
+        self.rope = RoPE(
+            hidden_size=config.hidden_size // config.num_attention_heads,
+            max_position_embeddings=config.max_position_embeddings,
+        )
         self.transformer = TransformerLayer(
             hidden_size=config.hidden_size,
             ffn_hidden_size=config.intermediate_size,
@@ -992,9 +997,11 @@ class LlamaDecoderLayerWithNVTEBackend(nn.Layer):
         assert position_ids is None, "position_ids is not supported in llama decoder layer with nvte backend"
         assert past_key_value is None, "past_key_value is not supported in llama decoder layer with nvte backend"
 
+        rotary_pos_emb = self.rope(self.config.seq_length)
         return self.transformer(
             hidden_states,
             attention_mask,
+            rotary_pos_emb=rotary_pos_emb,
             recompute_core_attention=(self.config.use_recompute and self.config.recompute_granularity == "core_attn"),
             is_first_microbatch=is_first_microbatch,
         )

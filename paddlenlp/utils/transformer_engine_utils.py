@@ -53,6 +53,13 @@ class TransformerEngineHelper:
         return _IS_TRANSFORMER_ENGINE_INSTALLED
 
     @staticmethod
+    def get_rope_layer():
+        assert (
+            TransformerEngineHelper.is_installed()
+        ), "TransformerEngine is not installed. Please install it first or disable it."
+        return te.RotaryPositionEmbedding
+
+    @staticmethod
     def get_transformer_layer():
         assert (
             TransformerEngineHelper.is_installed()
