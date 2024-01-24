@@ -958,7 +958,7 @@ class LlamaDecoderLayerWithNVTEBackend(nn.Layer):
         RoPE = TransformerEngineHelper.get_rope_layer()
         TransformerLayer = TransformerEngineHelper.get_transformer_layer()
         self.rope = RoPE(
-            hidden_size=config.hidden_size // config.num_attention_heads,
+            dim=config.hidden_size // config.num_attention_heads,
             max_position_embeddings=config.max_position_embeddings,
         )
         self.transformer = TransformerLayer(
@@ -969,6 +969,7 @@ class LlamaDecoderLayerWithNVTEBackend(nn.Layer):
             layernorm_epsilon=config.rms_norm_eps,
             hidden_dropout=0.0,  # no dropout in llama
             attention_dropout=0.0,  # no dropout in llama
+            bias_attr=False,
             self_attn_mask_type="causal",
             layer_type="encoder",
             normalization="RMSNorm",
