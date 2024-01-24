@@ -994,7 +994,7 @@ class LlamaDecoderLayerWithNVTEBackend(nn.Layer):
         ), "output_attentions is not supported in llama decoder layer with nvte backend"
         assert use_cache is False, "use_cache is not supported in llama decoder layer with nvte backend"
         assert alibi is None, "alibi is not supported in llama decoder layer with nvte backend"
-        assert position_ids is None, "position_ids is not supported in llama decoder layer with nvte backend"
+        # assert position_ids is None, "position_ids is not supported in llama decoder layer with nvte backend"
         assert past_key_value is None, "past_key_value is not supported in llama decoder layer with nvte backend"
 
         rotary_pos_emb = self.rope(self.config.seq_length)
