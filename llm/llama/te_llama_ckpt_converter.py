@@ -238,7 +238,7 @@ def convert_ckpt(args):
             # print(f"PD Layer: {name} | Size: {param.shape}")
             new_param_name = convert_param_name(args.mode, name)
             # if param is tensor and has shape [n, m], transpose it to [m, n]
-            if isinstance(param, paddle.Tensor) and len(param.shape) == 2 and "decoder" in name:
+            if isinstance(param, paddle.Tensor) and len(param.shape) == 2 and "llama.layers" in name:
                 new_param = param.transpose([1, 0])
                 new_state_dict[new_param_name] = new_param
             else:
