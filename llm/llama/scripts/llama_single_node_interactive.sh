@@ -39,7 +39,7 @@ max_seqlen=${10:-4096}
 sharding_stage=${11:-"stage2"}
 backend=${12:-"none"}
 precision=${13:-"bf16"}
-recompute=${14:-"full"}
+recompute=${14:-"none"}
 resume_step=${15:-"none"}
 init_weigth=${16:-"none"}
 nsys_profile=${17:-"false"}
@@ -145,7 +145,6 @@ ${nsys_cmd} python -u  -m paddle.distributed.launch \
     --ips="${IP_STR}" \
     --log_dir ${output_dir}/logs \
     ${PNLP_PATH}/llm/run_pretrain.py \
-    --model_type "llama" \
     --model_name_or_path ${model_name} \
     --tokenizer_name_or_path ${tokenizer_name} \
     --input_dir "$DATA_PATH" \
@@ -163,6 +162,7 @@ ${nsys_cmd} python -u  -m paddle.distributed.launch \
     --use_flash_attention 1 \
     --use_fused_rms_norm 0 \
     --use_fused_rope 1 \
+    --fuse_attention_ffn 1 \
     --bf16  \
     --fp16_opt_level "O2"  \
     --scale_loss 1024 \
@@ -195,3 +195,4 @@ ${nsys_cmd} python -u  -m paddle.distributed.launch \
 
     #--do_eval \
     #--do_predict \
+    #--model_type "llama" \
