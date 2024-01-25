@@ -182,12 +182,11 @@ def convert_qkv_proj_weight(mode, state_dict, new_state_dict, num_heads=None, nu
             qkv_proj_weight = state_dict[f"llama.layers.{layer_id}.transformer.self_attention.layernorm_qkv.weight"]
             # transpose qkv
             qkv_proj_weight = qkv_proj_weight.transpose([1, 0])
-            # split qkv
-            hidden_size = qkv_proj_weight.shape[1]
-            head_size = hidden_size // (num_heads + 2 * num_kv_heads)
             if num_kv_heads is None:
                 num_or_sections = 3
             else:
+                hidden_size = qkv_proj_weight.shape[1]
+                head_size = hidden_size // (num_heads + 2 * num_kv_heads)
                 num_or_sections = [head_size * num_heads, head_size * num_kv_heads, head_size * num_kv_heads]
             q_proj_weight, k_proj_weight, v_proj_weight = paddle.split(
                 qkv_proj_weight, num_or_sections=num_or_sections, axis=1
