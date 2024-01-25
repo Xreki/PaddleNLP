@@ -41,7 +41,7 @@ backend=${12:-"none"}
 precision=${13:-"bf16"}
 recompute=${14:-"none"}
 resume_step=${15:-"none"}
-init_weigth=${16:-"none"}
+init_weight=${16:-"none"}
 nsys_profile=${17:-"false"}
 
 dp=`expr $((8*SLURM_JOB_NUM_NODES)) / ${tp} / ${fsdp}`
@@ -113,10 +113,10 @@ else # ckpt_step is a number
     readonly resume_flag=" --resume_from_checkpoint $ckpt_path "
 fi
 
-if [ "${init_weigth}" == "none" ]; then
-   readonly init_weigth_flag=""
+if [ "${init_weight}" == "none" ]; then
+   readonly init_weight_flag=""
 else
-   readonly init_weigth_flag=" --te_init_weight_path ${init_weigth} "
+   readonly init_weight_flag=" --te_init_weight_path ${init_weight} "
 fi
 
 if [ "${nsys_profile}" == "false" ]; then
@@ -189,7 +189,7 @@ ${nsys_cmd} python -u  -m paddle.distributed.launch \
     $backend_flag \
     $precision_flag \
     $recompute_flag \
-    $init_weigth_flag \
+    $init_weight_flag \
     $sp_flag \
     --device "gpu"
 
