@@ -970,6 +970,7 @@ class LlamaDecoderLayerWithNVTEBackend(nn.Layer):
             hidden_dropout=0.0,  # no dropout in llama
             attention_dropout=0.0,  # no dropout in llama
             bias_attr=False,
+            max_sequence_length=config.seq_length,
             self_attn_mask_type="causal",
             layer_type="encoder",
             normalization="RMSNorm",
