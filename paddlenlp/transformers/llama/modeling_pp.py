@@ -166,11 +166,11 @@ class LlamaEmbeddingPipe(nn.Layer):
 
 
 class LlamaDecoderLayerPipeWithNVTEBackend(LlamaDecoderLayerWithNVTEBackend):
-    def __init__(self, config):
+    def __init__(self, config, layerwise_recompute: bool = False):
         strategy = fleet.fleet._user_defined_strategy
         self.num_steps = strategy.pipeline_configs["accumulate_steps"]
         self._micro_batch_id = 0
-        super().__init__(config)
+        super().__init__(config, layerwise_recompute=layerwise_recompute)
 
     def forward(self, args):
         is_first_microbatch = (self._micro_batch_id % self.num_steps) == 0
