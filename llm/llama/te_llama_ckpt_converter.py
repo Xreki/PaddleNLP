@@ -155,14 +155,13 @@ def convert_qkv_proj_weight(mode, state_dict, new_state_dict, num_heads=None, nu
     Convert the qkv projection weight from PD to TE, or from TE to PD.
     """
 
-    # find num layers in state dict
-    num_layers = 0
+    # save layer id in a ordered set
+    layer_id_set = set()
     for name in state_dict.keys():
         if "llama.layers." in name:
-            num_layers = max(num_layers, int(name.split(".")[2]))
-    num_layers += 1
+            layer_id_set.add(int(name.split(".")[2]))
 
-    for layer_id in range(num_layers):
+    for layer_id in layer_id_set:
         if mode == "pd2te":
             # convert pd to te
             q_proj_weight = state_dict[f"llama.layers.{layer_id}.self_attn.q_proj.weight"]
