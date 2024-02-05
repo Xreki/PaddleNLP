@@ -79,7 +79,10 @@ class TransformerEngineHelper:
             TransformerEngineHelper.is_installed()
         ), "TransformerEngine is not installed. Please install it first or disable it."
 
-        hcg = fleet.get_hybrid_communicate_group()
+        try:
+            hcg = fleet.get_hybrid_communicate_group()
+        except:
+            return None
         use_pp = hcg.get_pipe_parallel_world_size() > 1
         if not use_pp:
             return None
