@@ -110,6 +110,7 @@ class GPTEmbeddingPipe(GPTEmbeddings):
             attention_mask = (1.0 - (attention_mask & causal_mask)) * -1e4
         else:
             attention_mask = (1.0 - causal_mask) * -1e4
+        #attention_mask = None
 
         return return_args(embeddings, attention_mask, position_ids)
 
@@ -117,6 +118,8 @@ class GPTEmbeddingPipe(GPTEmbeddings):
 class GPTDecoderLayerPipe(GPTDecoderLayer):
     def forward(self, args):
         hidden_states, attention_mask, position_ids = parse_args(args)
+        #if attention_mask is not None:
+        #    print(f"-- attention_mask: shape={attention_mask.shape}, dtype={attention_mask.dtype}")
         if self.enable_recompute and self.config.recompute_granularity == "full":
             hidden_states = recompute(super().forward, hidden_states, attention_mask)
         else:

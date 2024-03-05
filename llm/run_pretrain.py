@@ -35,6 +35,7 @@ from paddlenlp.trainer import (
     speed_metrics,
 )
 from paddlenlp.trainer.trainer_utils import IntervalStrategy
+from paddlenlp.transformers import GPTConfig
 from paddlenlp.transformers import (
     AutoConfig,
     AutoModelForCausalLM,
@@ -423,7 +424,7 @@ def main():
             )
 
     tokenizer = AutoTokenizer.from_pretrained(model_args.tokenizer_name_or_path)
-    config = AutoConfig.from_pretrained(model_args.model_name_or_path)
+    config = GPTConfig.from_pretrained(model_args.model_name_or_path)
 
     config.seq_length = data_args.max_seq_length
     # There are some technique extend RotaryEmbedding context. so don't change max_position_embeddings
