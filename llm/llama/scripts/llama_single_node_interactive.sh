@@ -16,9 +16,9 @@
 
 set -ex
 
-PNLP_PATH="/workspace/PaddleNLP"
-OUTPUT_BASE=${OUTPUT_BASE:="/workspace/outputs"}
-DATA_PATH=/dataset
+PNLP_PATH="/work/models/PaddleNLP"
+OUTPUT_BASE=${OUTPUT_BASE:="${PNLP_PATH}/llm/llama/outputs"}
+DATA_PATH="${PNLP_PATH}/llm/llama/data"
 SLURM_JOB_NUM_NODES=${SLURM_JOB_NUM_NODES:=1}
 
 export PYTHONPATH="${PNLP_PATH}:${PYTHONPATH}"
@@ -141,7 +141,7 @@ if [ "${sp}" == "true" ]; then
 fi
 
 ${nsys_cmd} python -u  -m paddle.distributed.launch \
-    --gpus "0,1,2,3,4,5,6,7" \
+    --gpus "0,1,2,3" \
     --ips="${IP_STR}" \
     --log_dir ${output_dir}/logs \
     ${PNLP_PATH}/llm/run_pretrain.py \
@@ -169,7 +169,7 @@ ${nsys_cmd} python -u  -m paddle.distributed.launch \
     --learning_rate 3e-05 \
     --min_learning_rate 3e-06 \
     --warmup_steps 30 \
-    --max_steps 20000 \
+    --max_steps 30 \
     --save_steps 10000 \
     --weight_decay 0.01 \
     --warmup_ratio 0.01 \
