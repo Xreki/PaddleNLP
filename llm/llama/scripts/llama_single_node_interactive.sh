@@ -16,12 +16,12 @@
 
 set -ex
 
-PNLP_PATH="/workspace/PaddleNLP"
-OUTPUT_BASE=${OUTPUT_BASE:="/workspace/outputs"}
-DATA_PATH=/dataset
+PNLP_PATH="/work/models/PaddleNLP"
+OUTPUT_BASE=${OUTPUT_BASE:="${PNLP_PATH}/llm/llama/scripts/outputs"}
+DATA_PATH=${PNLP_PATH}/llm/llama/data
 SLURM_JOB_NUM_NODES=${SLURM_JOB_NUM_NODES:=1}
 
-export PYTHONPATH="${PNLP_PATH}:${PYTHONPATH}"
+export PYTHONPATH="${PNLP_PATH}:/work/models/PaPerf:${PYTHONPATH}"
 export NVTE_FUSED_ATTN=1
 #export NVTE_ASYNC_AMAX_REDUCTION=1  # enable async allreduce
 #export CUDA_DEVICE_MAX_CONNECTIONS=1
@@ -49,8 +49,6 @@ dp=`expr $((8*SLURM_JOB_NUM_NODES)) / ${tp} / ${fsdp}`
 log_dir=${EXP_NAME:="N${SLURM_JOB_NUM_NODES}_DP${dp}_TP${tp}_PP${pp}_VP${vp}_GA${ga}_SP${sp}_FSDP${fsdp}_MBS${per_device_batch_size}_${backend}_${precision}_${recompute}_${model_name}"}
 #rm -rf $log_dir
 output_dir="${OUTPUT_BASE}/$log_dir"
-
-IP_STR=${IP_STR:='127.0.0.1'}
 
 if [ "${backend}" == "none" ]; then
    readonly backend_flag=""
@@ -140,9 +138,28 @@ if [ "${sp}" == "true" ]; then
    sp_flag="--sequence_parallel --pipeline_parallel_config=disable_partial_send_recv"
 fi
 
-${nsys_cmd} python -u  -m paddle.distributed.launch \
-    --gpus "0,1,2,3,4,5,6,7" \
-    --ips="${IP_STR}" \
+unset PADDLE_ELASTIC_JOB_ID
+unset PADDLE_TRAINER_ENDPOINTS
+unset DISTRIBUTED_TRAINER_ENDPOINTS
+unset FLAGS_START_PORT
+unset PADDLE_ELASTIC_TIMEOUT
+unset PADDLE_TRAINERS_NUM
+unset PADDLE_TRAINER_ID
+unset PADDLE_WORKERS_IP_PORT_LIST
+unset PADDLE_TRAINERS
+unset PADDLE_NUM_GRADIENT_SERVERS
+
+nnodes=${SLURM_JOB_NUM_NODES}
+rank=0
+master="10.55.120.32"
+
+distributed_args="--master=${master}:36677 --nnodes $nnodes"
+
+OUTPUT_FILENAME=paddle_Llama-2-7b.gbs32_mp${tp}pp${pp}sd${fsdp}_vpp${vp}_mbs${per_device_batch_size}_acc${ga}.1xH20_te_${precision}.20240412
+#nsys_args="nsys profile --stats true -w true -t cuda,nvtx,osrt,cudnn,cublas --capture-range=cudaProfilerApi -x true --force-overwrite true -o ${OUTPUT_FILENAME}"
+
+${nsys_args} python -u  -m paddle.distributed.launch \
+    --gpus "0,1,2,3,4,5,6,7" ${distributed_args} \
     --log_dir ${output_dir}/logs \
     ${PNLP_PATH}/llm/run_pretrain.py \
     --model_name_or_path ${model_name} \
@@ -165,6 +182,7 @@ ${nsys_cmd} python -u  -m paddle.distributed.launch \
     --fuse_attention_ffn 1 \
     --bf16  \
     --fp16_opt_level "O2"  \
+    --amp_master_grad true \
     --scale_loss 1024 \
     --learning_rate 3e-05 \
     --min_learning_rate 3e-06 \
@@ -184,6 +202,7 @@ ${nsys_cmd} python -u  -m paddle.distributed.launch \
     --do_train \
     --continue_training 0 \
     --distributed_dataloader 1 \
+    --sharding_parallel_config "split_param enable_stage1_overlap" \
     $stage_flag \
     $resume_flag \
     $backend_flag \

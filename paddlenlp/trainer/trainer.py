@@ -931,7 +931,7 @@ class Trainer:
                     steps_trained_progress_bar = None
 
                 if step_control % args.gradient_accumulation_steps == 0:
-                    profile_paddle.switch_profile(self.state.global_step, 10, 12, enable_layerwise_event=True)
+                    # profile_paddle.switch_profile(self.state.global_step, 10, 12, enable_layerwise_event=True)
                     self.control = self.callback_handler.on_step_begin(args, self.state, self.control)
                     self.timers and self.timers("forward-backward").start()
 
