@@ -22,11 +22,15 @@ export case_list=()
 
 target_lists_for_gpt=(
     "model_zoo/gpt-3"
+    "scripts/distribute"
 )
 
 target_lists_for_llama=(
     "llm/llama/auto_parallel"
+    "paddlenlp/trainer/auto_trainer.py"
+    "paddlenlp/transformers/llama/modeling_auto_static.py"
     "paddlenlp/transformers/llama/modeling_auto.py"
+    "scripts/distribute"
 )
 
 target_path_for_ci_scripts="scripts/distribute"
@@ -46,6 +50,7 @@ install_paddlenlp(){
     python -m pip uninstall paddlenlp -y
     rm -rf build/ && rm -rf paddlenlp.egg-info/ && rm -rf dist/
     python -m pip install --ignore-installed -r requirements.txt
+    python -m pip install --ignore-installed -r requirements-dev.txt
     python setup.py install
     python setup.py build_ext
     python setup.py bdist_wheel
@@ -65,12 +70,13 @@ for file_name in `git diff --numstat upstream/${AGILE_COMPILE_BRANCH} |awk '{pri
     dir4=${arr_file_name[3]}
     file_item=$dir1/$dir2/$dir3/$dir4
     echo "file_name:"${file_name}, "path:"${file_item}
+    if [[ ${dir1} =~ "paddlenlp" ]];then
+	    export FLAGS_paddlenlp=1
+    fi
     if [ ! -f ${file_name} ];then # 针对pr删掉文件
         continue
     elif [[ ${file_name##*.} == "md" ]] || [[ ${file_name##*.} == "rst" ]] || [[ ${dir1} == "docs" ]];then
         continue
-    elif [[ ${dir1} =~ "paddlenlp" ]];then
-	    export FLAGS_paddlenlp=1
     else
         for ((i=0; i<${#target_lists_for_gpt[@]}; i++)); do
             if [[ ! ${dir3} =~ "benchmarks" ]] && [[ ${file_item} == *${target_lists_for_gpt[i]}* ]];then
@@ -144,6 +150,13 @@ if [[ ${#case_list[*]} -ne 0 ]];then
         export FLAGS_install_deps=1
         export FLAGS_download_data="gpt ""$FLAGS_download_data"
         let case_num++
+
+        echo -e "\033[31m ---- running case $case_num/${#case_list[*]}: gpt-3_auto \033"
+        bash /workspace/PaddleNLP/scripts/distribute/ci_case_auto.sh llm_gpt_case_list_auto $FLAGS_install_deps $FLAGS_download_data
+        print_info $? `ls -lt ${log_path} | grep gpt | head -n 1 | awk '{print $9}'` gpt-3_auto
+        export FLAGS_install_deps=1
+        export FLAGS_download_data="gpt ""$FLAGS_download_data"
+        let case_num++        
     fi
     if [[ $(contain_case gpt-3_dygraph ${case_list[@]}; echo $?) -eq 1 ]];then
         echo -e "\033[31m ---- running case $case_num/${#case_list[*]}: gpt-3_dygraph \033"

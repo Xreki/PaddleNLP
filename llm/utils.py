@@ -25,7 +25,6 @@ import paddle.distributed as dist
 import paddle.incubate.multiprocessing as mp
 from paddle.distributed import fleet
 from paddle.io import BatchSampler, DataLoader, DistributedBatchSampler
-from paddlenlp_ops import get_output
 from sklearn.metrics import accuracy_score
 
 from paddlenlp.datasets import InTokensIterableDataset
@@ -149,6 +148,16 @@ def get_lora_target_modules(model):
             ".*mlp.w1.*",
             ".*mlp.w2.*",
             ".*mlp.c_proj.*",
+        ]
+    elif model.base_model_prefix == "mixtral":
+        target_modules = [
+            ".*q_proj.*",
+            ".*k_proj.*",
+            ".*v_proj.*",
+            ".*o_proj.*",
+            ".*w1.*",
+            ".*w2.*",
+            ".*w3.*",
         ]
     else:
         raise ValueError(f"Unknown base_model_prefix: {model.base_model_prefix}.")
@@ -704,6 +713,9 @@ def read_res(model_name_or_path: str, tensor_queue: mp.Queue, result_queue: mp.Q
 
     logger.info("Start read result message")
     logger.info(f"Current path is {os.getcwd()}")
+
+    from paddlenlp_ops import get_output
+
     while True:
         get_output(output_tensor, 0, True)
         if output_tensor[0, 0] == -2:  # read none

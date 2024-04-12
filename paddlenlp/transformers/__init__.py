@@ -29,7 +29,7 @@ from .processing_utils import ProcessorMixin
 from .feature_extraction_utils import BatchFeature, FeatureExtractionMixin
 from .image_processing_utils import ImageProcessingMixin
 from .attention_utils import create_bigbird_rand_mask_idx_list
-from .sequence_parallel_utils import (
+from paddle.distributed.fleet.utils.sequence_parallel_utils import (
     GatherOp,
     ScatterOp,
     AllGatherOp,
@@ -281,6 +281,14 @@ from .rw.modeling import *
 from .rw.configuration import *
 from .rw.tokenizer import *
 from .qwen import *
+from .mixtral.modeling import *
+from .mixtral.configuration import *
+from .deberta.modeling import *
+from .deberta.tokenizer import *
+from .deberta.configuration import *
+from .deberta_v2.modeling import *
+from .deberta_v2.tokenizer import *
+from .deberta_v2.configuration import *
 
 # For faster tokenizer
 from ..utils.import_utils import is_fast_tokenizer_available

@@ -58,7 +58,7 @@ from .tokenizer_utils_base import (
     TextInputPair,
     TruncationStrategy,
 )
-from .utils import InitTrackerMeta, fn_args_to_dict, resolve_cache_dir
+from .utils import InitTrackerMeta, fn_args_to_dict
 
 __all__ = [
     "PretrainedTokenizer",
@@ -562,6 +562,11 @@ class ChatTemplate:
         template = self._compile_jinja_template(self.query)
         return template.render(query=query, index=index, **context_data)
 
+    def _init_context_data(self, context_data: Dict[str, Union[int, str]] = {}) -> Dict[str, Union[int, str]]:
+        """init the context data for chat-template"""
+        context_data["is_training"] = context_data.get("is_training", False)
+        return context_data
+
     def render_system(self, context_data: Dict[str, Union[int, str]] = {}) -> str:
         if self.system is None:
             return ""
@@ -633,6 +638,8 @@ class ChatTemplateMixin:
         Returns:
             str | dict[str, numpy.ndarray | paddle.Tensor]: return the result of applied data
         """
+        context_data = self.chat_template._init_context_data(context_data)
+
         if isinstance(conversation, str):
             conversation = [[conversation]]
         elif isinstance(conversation, list) and isinstance(conversation[0], str):
@@ -661,6 +668,7 @@ class ChatTemplateMixin:
         Returns:
             List[list[int], list[int]]: the pair of input_ids and target_ids
         """
+        context_data = self.chat_template._init_context_data(context_data)
         # encode system
         result = {}
         if self.chat_template.system:
@@ -693,7 +701,6 @@ class ChatTemplateMixin:
         if subfolder is None:
             subfolder = ""
 
-        cache_dir = resolve_cache_dir(from_hf_hub, from_aistudio, cache_dir)
         kwargs["subfolder"] = subfolder
         kwargs["cache_dir"] = cache_dir
         kwargs["from_hf_hub"] = from_hf_hub

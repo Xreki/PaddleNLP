@@ -170,6 +170,10 @@ class LlamaConfig(PretrainedConfig):
         rope_scaling_type=None,
         transformer_engine_backend: str = None,
         use_fp8: bool = False,
+        long_sequence_strategy_type=None,
+        long_sequence_strategy_name=None,
+        long_sequence_init_args=None,
+        use_long_sequence_strategies=False,
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -211,6 +215,11 @@ class LlamaConfig(PretrainedConfig):
         self.rope_scaling_type = rope_scaling_type
         self.transformer_engine_backend = transformer_engine_backend
         self.use_fp8 = use_fp8
+
+        self.long_sequence_strategy_type = long_sequence_strategy_type
+        self.long_sequence_strategy_name = long_sequence_strategy_name
+        self.long_sequence_init_args = {} if long_sequence_init_args is None else long_sequence_init_args
+        self.use_long_sequence_strategies = use_long_sequence_strategies
 
         super().__init__(
             pad_token_id=pad_token_id,
