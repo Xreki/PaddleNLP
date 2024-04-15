@@ -1,5 +1,5 @@
-# Copyright (c) 2023 PaddlePaddle Authors. All Rights Reserved.
-# Copyright 2023 Mistral AI and the HuggingFace Inc. team. All rights reserved.
+# Copyright (c) 2024 PaddlePaddle Authors. All Rights Reserved.
+# Copyright 2024 EleutherAI and the HuggingFace Inc. team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,151 +12,78 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Paddle Mixtral model"""
-from __future__ import annotations
 
 import math
 import warnings
 from functools import partial
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 import paddle
 import paddle.distributed.fleet.meta_parallel as mpu
 import paddle.nn.functional as F
 from paddle import Tensor, nn
+from paddle.autograd import PyLayer
 from paddle.distributed import fleet
 from paddle.distributed.fleet.meta_parallel import get_rng_state_tracker
 from paddle.distributed.fleet.utils import recompute
+from paddle.utils import try_import
 
 try:
     from paddle.incubate.nn.functional import fused_rotary_position_embedding
 except ImportError:
     fused_rotary_position_embedding = None
 
-try:
-    from paddle.distributed.fleet.utils.sequence_parallel_utils import (
-        ColumnSequenceParallelLinear,
-        GatherOp,
-        RowSequenceParallelLinear,
-        ScatterOp,
-        mark_as_sequence_parallel_parameter,
-    )
-except:
-    pass
+
+from paddle.distributed.fleet.utils.sequence_parallel_utils import (
+    ColumnSequenceParallelLinear,
+    GatherOp,
+    RowSequenceParallelLinear,
+    ScatterOp,
+    mark_as_sequence_parallel_parameter,
+)
 
 from paddlenlp.transformers.conversion_utils import (
     StateDictNameMapping,
     init_name_mappings,
 )
 from paddlenlp.transformers.model_outputs import (
-    MoECausalLMOutputWithPast,
-    MoEModelOutputWithPast,
+    BaseModelOutputWithPastAndCrossAttentions,
+    CausalLMOutputWithCrossAttentions,
 )
 from paddlenlp.transformers.model_utils import PretrainedModel, register_base_model
-from paddlenlp.utils.log import logger
 
-from ..activations import ACT2FN
-from .configuration import MixtralConfig
+from ..segment_parallel_utils import ReshardLayer
+from .configuration import (
+    GEMMA_PRETRAINED_INIT_CONFIGURATION,
+    GEMMA_PRETRAINED_RESOURCE_FILES_MAP,
+    GemmaConfig,
+)
 
 try:
     from paddle.nn.functional.flash_attention import flash_attention
 except:
     flash_attention = None
 
-__all__ = [
-    "MixtralModel",
-    "MixtralPretrainedModel",
-    "MixtralForCausalLM",
-    "MixtralPretrainingCriterion",
-]
 
+def _get_interleave(n):
+    def _get_interleave_power_of_2(n):
+        start = 2 ** (-(2 ** -(math.log2(n) - 3)))
+        ratio = start
+        return [start * ratio**i for i in range(n)]
 
-def load_balancing_loss_func(gate_logits, num_experts, top_k=2, attention_mask=None):
-    """
-    Computes auxiliary load balancing loss as in Switch Transformer - implemented in Paddle.
-    See Switch Transformer (https://arxiv.org/abs/2101.03961) for more details. This function implements the loss
-    function presented in equations (4) - (6) of the paper. It aims at penalizing cases where the routing between
-    experts is too unbalanced.
-    Args:
-        gate_logits (Union[`paddle.Tensor`, Tuple[paddle.Tensor]):
-            Logits from the `gate`, should be a tuple of model.config.num_hidden_layers tensors of
-            shape [batch_size X sequence_length, num_experts].
-        num_experts (`int`):
-            Number of experts.
-        top_k (`int`):
-            Number of top k experts to be considered for the loss computation.
-        attention_mask (`paddle.Tensor`, None):
-            The attention_mask used in forward function
-            shape [batch_size X sequence_length] if not None.
-    Returns:
-        The auxiliary loss.
-    """
-    if gate_logits is None or not isinstance(gate_logits, tuple):
-        return 0
-
-    if isinstance(gate_logits, tuple):
-        concatenated_gate_logits = paddle.concat(
-            gate_logits, axis=0
-        )  # [num_hidden_layers X batch_size X sequence_length, num_experts]
-
-    routing_weights = F.softmax(concatenated_gate_logits, axis=-1)
-    _, selected_experts = paddle.topk(routing_weights, top_k, axis=-1)
-    expert_mask = F.one_hot(
-        selected_experts, num_classes=num_experts
-    )  # [num_hidden_layers X batch_size X sequence_length, top_k, num_experts]
-
-    if attention_mask is None or len(attention_mask.shape) == 4:
-        # Only intokens strategy has 4-D attention_mask, we currently do not support excluding padding tokens.
-        # Compute the percentage of tokens routed to each experts
-        tokens_per_expert = paddle.mean(expert_mask.astype("float32"), axis=0)
-
-        # Compute the average probability of routing to these experts
-        router_prob_per_expert = paddle.mean(routing_weights, axis=0)
+    if math.log2(n).is_integer():
+        return _get_interleave_power_of_2(n)
     else:
-        # Exclude the load balancing loss of padding tokens.
-        if len(attention_mask.shape) == 2:
-            batch_size, sequence_length = attention_mask.shape
-            num_hidden_layers = concatenated_gate_logits.shape[0] // (batch_size * sequence_length)
-
-            # Compute the mask that masks all padding tokens as 0 with the same shape of expert_mask
-            expert_attention_mask = (
-                attention_mask[None, :, :, None, None]
-                .expand((num_hidden_layers, batch_size, sequence_length, top_k, num_experts))
-                .reshape([-1, top_k, num_experts])
-            )  # [num_hidden_layers * batch_size * sequence_length, top_k, num_experts]
-
-            # Compute the percentage of tokens routed to each experts
-            tokens_per_expert = paddle.sum(expert_mask.astype("float32") * expert_attention_mask, axis=0) / paddle.sum(
-                expert_attention_mask, axis=0
-            )
-
-            # Compute the mask that masks all padding tokens as 0 with the same shape of tokens_per_expert
-            router_per_expert_attention_mask = (
-                attention_mask[None, :, :, None]
-                .expand((num_hidden_layers, batch_size, sequence_length, num_experts))
-                .reshape([-1, num_experts])
-            )
-
-            # Compute the average probability of routing to these experts
-            router_prob_per_expert = paddle.sum(
-                routing_weights * router_per_expert_attention_mask, axis=0
-            ) / paddle.sum(router_per_expert_attention_mask, axis=0)
-
-    overall_loss = paddle.sum(tokens_per_expert * router_prob_per_expert.unsqueeze(0))
-    return overall_loss * num_experts
+        closest_power_of_2 = 2 ** math.floor(math.log2(n))
+        return (
+            _get_interleave_power_of_2(closest_power_of_2)
+            + _get_interleave(2 * closest_power_of_2)[0::2][: n - closest_power_of_2]
+        )
 
 
-def get_triangle_upper_mask(x, mask=None):
-    if mask is not None:
-        return mask
-    # [bsz, n_head, q_len, kv_seq_len]
-    shape = x.shape
-    #  [bsz, 1, q_len, kv_seq_len]
-    shape[1] = 1
-    mask = paddle.full(shape, paddle.finfo(x.dtype).min, dtype=x.dtype)
-    mask = paddle.triu(mask, diagonal=1)
-    mask.stop_gradient = True
-    return mask
+def rms_norm_fused(x_in, w, eps):
+    fused_ln = try_import("fused_ln")
+    return fused_ln.fused_rms_norm(x_in, w, eps)[0]
 
 
 def assign_kv_heads(num_kv_heads: int, num_gpus: int):
@@ -188,7 +115,46 @@ def assign_kv_heads(num_kv_heads: int, num_gpus: int):
     return assignment_list
 
 
-def parallel_matmul(x: Tensor, y: Tensor, tensor_parallel_output=True):
+def build_alibi_tensor(
+    bool_attention_mask: Tensor, num_heads: int, dtype: paddle.dtype, tensor_parallel_degree=1
+) -> Tensor:
+    attention_mask = bool_attention_mask.astype("float32")
+    batch_size, seq_length = attention_mask.shape[0], attention_mask.shape[-1]
+    slopes = paddle.to_tensor(_get_interleave(num_heads), dtype="float32")
+    alibi = slopes.unsqueeze(axis=[1, 2]) * paddle.arange(seq_length, dtype="float32").unsqueeze(axis=[0, 1]).expand(
+        [num_heads, -1, -1]
+    )
+    alibi = alibi.reshape(shape=(1, num_heads, 1, seq_length)).expand([batch_size, -1, -1, -1])
+    return paddle.cast(alibi, dtype)
+
+
+def get_triangle_upper_mask(x, mask=None):
+    if mask is not None:
+        return mask
+    # [bsz, n_head, q_len, kv_seq_len]
+    shape = x.shape
+    #  [bsz, 1, q_len, kv_seq_len]
+    shape[1] = 1
+    mask = paddle.full(shape, paddle.finfo(x.dtype).min, dtype=x.dtype)
+    mask = paddle.triu(mask, diagonal=1)
+    mask.stop_gradient = True
+    return mask
+
+
+def repeat_kv(hidden_states: paddle.Tensor, n_rep: int) -> paddle.Tensor:
+    """
+    This is the equivalent of paddle.repeat_interleave(hidden_states, n_rep, axis=1). The hidden states go from (batch,
+    num_key_value_heads, seqlen, head_dim) to (batch, num_attention_heads, seqlen, head_dim)
+    """
+    batch, slen, num_key_value_heads, head_dim = hidden_states.shape
+    if n_rep == 1:
+        return hidden_states
+
+    hidden_states = hidden_states.unsqueeze(-2).tile([1, 1, 1, n_rep, 1])
+    return hidden_states.reshape([batch, slen, num_key_value_heads * n_rep, head_dim])
+
+
+def parallel_matmul(x: Tensor, y, tensor_parallel_output=True, transpose_y=False):
     is_fleet_init = True
     tensor_parallel_degree = 1
     try:
@@ -206,7 +172,7 @@ def parallel_matmul(x: Tensor, y: Tensor, tensor_parallel_output=True):
     if is_fleet_init and tensor_parallel_degree > 1 and y_is_distributed:
         # if not running under distributed.launch, it will raise AttributeError: 'Fleet' object has no attribute '_hcg'
         input_parallel = paddle.distributed.collective._c_identity(x, group=model_parallel_group)
-        logits = paddle.matmul(input_parallel, y, transpose_y=False)
+        logits = paddle.matmul(input_parallel, y, transpose_y=transpose_y)
 
         if tensor_parallel_output:
             return logits
@@ -214,7 +180,7 @@ def parallel_matmul(x: Tensor, y: Tensor, tensor_parallel_output=True):
         return paddle.distributed.collective._c_concat(logits, group=model_parallel_group)
 
     else:
-        logits = paddle.matmul(x, y, transpose_y=False)
+        logits = paddle.matmul(x, y, transpose_y=transpose_y)
         return logits
 
 
@@ -225,8 +191,11 @@ def scaled_dot_product_attention(
     value_states,
     attention_mask,
     output_attentions,
-    training=True,
+    alibi=None,
     sequence_parallel=False,
+    reshard_layer=None,
+    attn_dropout_prob=0.0,
+    trainer_mode=False,
 ):
     bsz, q_len, num_heads, head_dim = query_states.shape
     _, kv_seq_len, _, _ = value_states.shape
@@ -237,24 +206,42 @@ def scaled_dot_product_attention(
 
         version = paddle.version.full_version
         if version != "0.0.0" and version <= "2.5.2":
+            if alibi is not None:
+                raise ValueError("Flash Attention doesn't support alibi")
             attn_output, attn_weights = flash_attention(
                 query_states,
                 key_states,
                 value_states,
                 causal=True,
+                dropout=attn_dropout_prob,
                 return_softmax=output_attentions,
             )
         else:
+            if alibi is not None:
+                alibi = alibi.reshape([bsz, num_heads, 1, -1])
+                attention_mask = attention_mask.cast(alibi.dtype) + alibi
             attn_output = F.scaled_dot_product_attention(
                 query_states,
                 key_states,
                 value_states,
                 attn_mask=attention_mask,
                 is_causal=attention_mask is None,
-                dropout_p=config.attention_dropout if training else 0.0,
-                training=training,
             )
             attn_weights = None
+
+        if reshard_layer is not None:
+            # attn_output shape: [bs, seqlen, num_head/sep, head_dim]
+            attn_output = reshard_layer(
+                attn_output,
+                split_axis=1,
+                concat_axis=2,
+            )
+            # attn_output shape: [bs, seqlen/sep, num_head, head_dim]
+            assert (
+                config.sep_parallel_degree > 1 and q_len % config.sep_parallel_degree == 0
+            ), f"q_len:{q_len}, config.sep_parallel_degree:{config.sep_parallel_degree}"
+            q_len = q_len // config.sep_parallel_degree
+            num_heads = num_heads * config.sep_parallel_degree
 
         if sequence_parallel:
             attn_output = attn_output.reshape([bsz * q_len, head_dim * num_heads])
@@ -270,6 +257,10 @@ def scaled_dot_product_attention(
 
         # matmul and devide by sqrt(head_dim)
         attn_weights = paddle.matmul(query_states / math.sqrt(head_dim), key_states.transpose([0, 1, 3, 2]))
+        # then add alibi bias
+        if alibi is not None:
+            alibi = alibi.reshape([bsz, num_heads, 1, -1])
+            attn_weights = attn_weights + alibi
 
         if attn_weights.shape != [bsz, num_heads, q_len, kv_seq_len]:
             raise ValueError(
@@ -277,6 +268,13 @@ def scaled_dot_product_attention(
                 f" {attn_weights.shape}"
             )
 
+        # In sep mode, the attenion mask should be created in the runtime.
+        if reshard_layer is not None:
+            attention_mask = None
+
+        # NOTE: we only call get_triangle_upper_mask under PP setup
+        # FIXME ZHUI when we use pipeline parallel, the attention_mask can be None
+        # we just make it triangle_upper_mask
         if attention_mask is None:
             attention_mask = get_triangle_upper_mask(attn_weights)
         attention_mask = attention_mask.reshape([bsz, 1, q_len, kv_seq_len])
@@ -291,22 +289,24 @@ def scaled_dot_product_attention(
         else:
             with paddle.amp.auto_cast(False):
                 attn_weights = F.softmax(attn_weights, axis=-1, dtype="float32").astype(query_states.dtype)
-
-        attn_weights = F.dropout(attn_weights, p=config.attention_dropout, training=training)
-
+        attn_weights = F.dropout(attn_weights, attn_dropout_prob, training=trainer_mode)
         attn_output = paddle.matmul(attn_weights, value_states)
         attn_output = attn_output.transpose([0, 2, 1, 3])
+
+        if reshard_layer is not None:
+            attn_output = reshard_layer(
+                attn_output,
+                split_axis=1,
+                concat_axis=2,
+            )
+            q_len = q_len // config.sep_parallel_degree
+            num_heads = num_heads * config.sep_parallel_degree
 
         if sequence_parallel:
             attn_output = attn_output.reshape([bsz * q_len, head_dim * num_heads])
         else:
             attn_output = attn_output.reshape([bsz, q_len, head_dim * num_heads])
         return (attn_output, attn_weights) if output_attentions else attn_output
-
-
-def masked_fill(x, mask, value):
-    y = paddle.full(x.shape, value, x.dtype)
-    return paddle.where(mask, y, x)
 
 
 def is_casual_mask(attention_mask):
@@ -346,7 +346,7 @@ def _expand_2d_mask(mask, dtype, tgt_length):
     return expanded_mask
 
 
-class MixtralRMSNorm(nn.Layer):
+class GemmaRMSNorm(nn.Layer):
     def __init__(self, config):
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -361,68 +361,32 @@ class MixtralRMSNorm(nn.Layer):
         if config.sequence_parallel:
             mark_as_sequence_parallel_parameter(self.weight)
 
-    def forward(self, hidden_states):
-        if paddle.in_dynamic_mode():
-            with paddle.amp.auto_cast(False):
-                hidden_states = hidden_states.astype("float32")
-                variance = hidden_states.pow(2).mean(-1, keepdim=True)
-                hidden_states = paddle.rsqrt(variance + self.variance_epsilon) * hidden_states
-        else:
-            hidden_states = hidden_states.astype("float32")
-            variance = hidden_states.pow(2).mean(-1, keepdim=True)
-            hidden_states = paddle.rsqrt(variance + self.variance_epsilon) * hidden_states
+    def _norm(self, x):
+        return x * paddle.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.variance_epsilon)
 
-        if self.weight.dtype in [paddle.float16, paddle.bfloat16]:
-            hidden_states = paddle.cast(hidden_states, self.weight.dtype)
-        return hidden_states * self.weight
+    def forward(self, x):
+        if self.config.use_fused_rms_norm:
+            return rms_norm_fused(x, self.weight + 1, self.variance_epsilon)
+
+        output = self._norm(x.astype(paddle.float32)).astype(x.dtype)
+        return output * (self.weight + 1)
 
 
-def repeat_kv(hidden_states: paddle.Tensor, n_rep: int) -> paddle.Tensor:
-    """
-    This is the equivalent of paddle.repeat_interleave(hidden_states, n_rep, axis=1). The hidden states go from (batch,
-    num_key_value_heads, seqlen, head_dim) to (batch, num_attention_heads, seqlen, head_dim)
-    """
-    batch, slen, num_key_value_heads, head_dim = hidden_states.shape
-    if n_rep == 1:
-        return hidden_states
-
-    hidden_states = hidden_states.unsqueeze(-2).tile([1, 1, 1, n_rep, 1])
-    return hidden_states.reshape([batch, slen, num_key_value_heads * n_rep, head_dim])
-
-
-class MixtralRotaryEmbedding(nn.Layer):
+class GemmaRotaryEmbedding(nn.Layer):
     def __init__(self, dim, max_position_embeddings=2048, base=10000):
         super().__init__()
+
         self.dim = dim
         self.max_position_embeddings = max_position_embeddings
         self.base = base
-        # [dim / 2]
         self.inv_freq = 1.0 / (self.base ** (paddle.cast(paddle.arange(0, self.dim, 2), dtype="float32") / self.dim))
-        self._set_cos_sin_cache(seq_len=max_position_embeddings)
-
-    def _set_cos_sin_cache(self, seq_len):
-        self.max_seq_len_cached = seq_len
-        # [seq_len]
-        t = paddle.arange(seq_len, dtype="float32")
-        # [seq_len, dim/2]
-        freqs = paddle.einsum("i,j->ij", t, self.inv_freq)
-        # Different from paper, but it uses a different permutation in order to obtain the same calculation
-        # [seq_len, dim]
-        emb = paddle.concat([freqs, freqs], axis=-1)
-        # [1, seqlen, 1, dim]
-        self.cos_cached = emb.cos()[None, :, None, :]
-        self.sin_cached = emb.sin()[None, :, None, :]
 
     def forward(self, x, seq_len=None):
         # x: [bs, num_attention_heads, seq_len, head_size]
-        if seq_len > self.max_seq_len_cached:
-            self._set_cos_sin_cache(seq_len)
-        cos = self.cos_cached[:, :seq_len, :, :]
-        sin = self.sin_cached[:, :seq_len, :, :]
-        return (
-            cos.cast(x.dtype) if cos.dtype != x.dtype else cos,
-            sin.cast(x.dtype) if sin.dtype != x.dtype else sin,
-        )
+        t = paddle.arange(seq_len, dtype="float32")
+        freqs = paddle.einsum("i,j->ij", t, self.inv_freq)
+        emb = paddle.concat([freqs, freqs], axis=-1)
+        return (emb.cos()[None, :, None, :].cast(dtype=x.dtype), emb.sin()[None, :, None, :].cast(dtype=x.dtype))
 
 
 def rotate_half(x):
@@ -435,7 +399,7 @@ def rotate_half(x):
 def apply_rotary_pos_emb(q, k, cos, sin, position_ids):
 
     if position_ids is None:
-        # Note: Only for MixtralForCausalLMPipe model pretraining
+        # Note: Only for ForCausalLMPipe model pretraining
         cos = cos[:, : q.shape[1], :, :]  # [bs, seq_len, 1, dim]
         sin = sin[:, : q.shape[1], :, :]  # [bs, seq_len, 1, dim]
     else:
@@ -448,7 +412,7 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids):
     return q_embed, k_embed
 
 
-class MixtralMLP(nn.Layer):
+class GemmaMLP(nn.Layer):
     def __init__(self, config):
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -459,115 +423,60 @@ class MixtralMLP(nn.Layer):
             ColumnParallelLinear = ColumnSequenceParallelLinear
             RowParallelLinear = RowSequenceParallelLinear
         else:
-            ColumnParallelLinear = fleet.meta_parallel.ColumnParallelLinear
-            RowParallelLinear = fleet.meta_parallel.RowParallelLinear
+            ColumnParallelLinear = mpu.ColumnParallelLinear
+            RowParallelLinear = mpu.RowParallelLinear
 
         if config.tensor_parallel_degree > 1:
-            self.w1 = ColumnParallelLinear(
+            self.gate_proj = ColumnParallelLinear(
                 self.hidden_size,
                 self.intermediate_size,
                 gather_output=False,
                 has_bias=False,
             )
-            self.w3 = ColumnParallelLinear(
+            self.up_proj = ColumnParallelLinear(
                 self.hidden_size,
                 self.intermediate_size,
                 gather_output=False,
                 has_bias=False,
             )
-            self.w2 = RowParallelLinear(
+            self.down_proj = RowParallelLinear(
                 self.intermediate_size,
                 self.hidden_size,
                 input_is_parallel=True,
                 has_bias=False,
             )
         else:
-            self.w1 = nn.Linear(self.hidden_size, self.intermediate_size, bias_attr=False)
-            self.w2 = nn.Linear(self.intermediate_size, self.hidden_size, bias_attr=False)
-            self.w3 = nn.Linear(self.hidden_size, self.intermediate_size, bias_attr=False)
-
-        self.act_fn = ACT2FN[config.hidden_act]
+            self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias_attr=False)
+            self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias_attr=False)
+            self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias_attr=False)
 
     def forward(self, x):
-        x = self.act_fn(self.w1(x)) * self.w3(x)
-        x = self.w2(x)
-        return x
+        # GeGLU
+        out = self.down_proj(F.gelu(self.gate_proj(x)) * self.up_proj(x))
+        return out
 
 
-class MixtralSparseMoeBlock(nn.Layer):
-    def __init__(self, config: MixtralConfig):
-        super().__init__()
-        self.hidden_dim = config.hidden_size
-        self.ffn_dim = config.intermediate_size
-        self.num_experts = config.num_local_experts
-        self.top_k = config.num_experts_per_tok
-        self.gate = nn.Linear(self.hidden_dim, self.num_experts, bias_attr=False)
-        self.experts = nn.LayerList([MixtralMLP(config) for _ in range(self.num_experts)])
-
-    def forward(self, hidden_states):
-        batch_size, seq_len, hidden_dim = hidden_states.shape
-        hidden_states = hidden_states.reshape([-1, hidden_dim])
-        # router_logits: [batch_size * seq_len, num_experts]
-        router_logits = self.gate(hidden_states)
-
-        with paddle.amp.auto_cast(False):
-            routing_weights = F.softmax(router_logits.astype("float32"), axis=1)
-        routing_weights, selected_experts = paddle.topk(routing_weights, self.top_k, axis=-1)
-        routing_weights /= routing_weights.sum(axis=-1, keepdim=True)
-        # we cast back to input dtype
-        routing_weights = routing_weights.astype(hidden_states.dtype)
-
-        final_hidden_states = paddle.zeros(
-            [batch_size * seq_len, hidden_dim],
-            dtype=hidden_states.dtype,
-        )
-
-        # One hot encode the selected experts to create an expert mask
-        # this will be used to easily index which expert is going to be sollicitated.
-        # shape: [num_experts, top_k, batch_size * seq_len]
-        expert_mask = F.one_hot(selected_experts, num_classes=self.num_experts).transpose([2, 1, 0])
-
-        # Loop over all available experts in the model and perform the computation on each expert.
-        for expert_id in range(self.num_experts):
-            expert_layer = self.experts[expert_id]
-            idx, top_x = paddle.where(expert_mask[expert_id])
-
-            if top_x.shape[0] == 0:
-                continue
-
-            current_state = paddle.gather(hidden_states, top_x.squeeze())
-            current_hidden_states = expert_layer(current_state) * routing_weights[top_x, idx]
-
-            top_x = top_x.squeeze()
-            if top_x.shape == []:
-                top_x = paddle.to_tensor([top_x.item()])
-            final_hidden_states.index_add_(top_x, 0, current_hidden_states.astype(hidden_states.dtype))
-
-        final_hidden_states = final_hidden_states.reshape([batch_size, seq_len, hidden_dim])
-        return final_hidden_states, router_logits
-
-
-class MixtralAttention(nn.Layer):
+class GemmaAttention(nn.Layer):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
-    def __init__(self, config: MixtralConfig, layerwise_recompute: bool = False):
+    def __init__(self, config: GemmaConfig, layerwise_recompute: bool = False):
         super().__init__()
 
         self.config = config
+        self.attention_dropout = config.attention_dropout  # add
         self.hidden_size = config.hidden_size
         self.num_heads = config.num_attention_heads
-
-        self.head_dim = self.hidden_size // config.num_attention_heads
+        self.head_dim = config.head_dim
 
         self.num_key_value_heads = config.num_key_value_heads
-        assert config.num_attention_heads // config.num_key_value_heads
         self.num_key_value_groups = config.num_attention_heads // config.num_key_value_heads
-        self.gqa_or_mqa = config.num_attention_heads != config.num_key_value_heads
-        self.rope_theta = config.rope_theta
+
         self.max_position_embeddings = config.max_position_embeddings
         self.seq_length = config.seq_length
+        self.rope_theta = config.rope_theta
         self.sequence_parallel = config.sequence_parallel
 
+        self.kv_indices = None
         # Note that we will actually perform a recompute only if both enable_recompute and layerwise_recompute are set to True
         # Enable_recompute defaults to False and is controlled by Trainer
         self.enable_recompute = False
@@ -579,10 +488,14 @@ class MixtralAttention(nn.Layer):
             ), f"num_heads: {self.num_heads}, tensor_parallel_degree: {config.tensor_parallel_degree}"
             self.num_heads = self.num_heads // config.tensor_parallel_degree
 
-            assert (
-                self.num_key_value_heads % config.tensor_parallel_degree == 0
-            ), f"num_key_value_heads: {self.num_key_value_heads}, tensor_parallel_degree: {config.tensor_parallel_degree}"
-            self.num_key_value_heads = self.num_key_value_heads // config.tensor_parallel_degree
+            if self.num_key_value_heads % config.tensor_parallel_degree == 0:
+                self.num_key_value_heads = self.num_key_value_heads // config.tensor_parallel_degree
+            else:
+                self.kv_indices = paddle.to_tensor(
+                    assign_kv_heads(self.num_key_value_heads, config.tensor_parallel_degree)[
+                        config.tensor_parallel_rank
+                    ]
+                )
 
         self.use_fused_rope = config.use_fused_rope
         if self.use_fused_rope:
@@ -597,32 +510,46 @@ class MixtralAttention(nn.Layer):
             ColumnParallelLinear = ColumnSequenceParallelLinear
             RowParallelLinear = RowSequenceParallelLinear
         else:
-            ColumnParallelLinear = fleet.meta_parallel.ColumnParallelLinear
-            RowParallelLinear = fleet.meta_parallel.RowParallelLinear
+            ColumnParallelLinear = mpu.ColumnParallelLinear
+            RowParallelLinear = mpu.RowParallelLinear
 
         if config.tensor_parallel_degree > 1:
             self.q_proj = ColumnParallelLinear(
                 self.hidden_size,
-                self.hidden_size,
-                has_bias=False,
+                self.config.num_attention_heads * self.head_dim,
+                has_bias=config.attention_bias,
                 gather_output=False,
             )
-            self.k_proj = ColumnParallelLinear(
-                self.hidden_size,
-                self.config.num_key_value_heads * self.head_dim,
-                has_bias=False,
-                gather_output=False,
-            )
-            self.v_proj = ColumnParallelLinear(
-                self.hidden_size,
-                self.config.num_key_value_heads * self.head_dim,
-                has_bias=False,
-                gather_output=False,
-            )
+            if self.kv_indices is None:
+                # to revise shape
+                self.k_proj = ColumnParallelLinear(
+                    self.hidden_size,
+                    self.config.num_key_value_heads * self.head_dim,
+                    has_bias=config.attention_bias,
+                    gather_output=False,
+                )
+                self.v_proj = ColumnParallelLinear(
+                    self.hidden_size,
+                    self.config.num_key_value_heads * self.head_dim,
+                    has_bias=config.attention_bias,
+                    gather_output=False,
+                )
+            else:
+                self.k_proj = nn.Linear(
+                    self.hidden_size,
+                    self.config.num_key_value_heads * self.head_dim,
+                    bias_attr=False,
+                )
+                self.v_proj = nn.Linear(
+                    self.hidden_size,
+                    self.config.num_key_value_heads * self.head_dim,
+                    bias_attr=False,
+                )
+
         else:
             self.q_proj = nn.Linear(
                 self.hidden_size,
-                self.hidden_size,
+                self.config.num_attention_heads * self.head_dim,
                 bias_attr=False,
             )
             self.k_proj = nn.Linear(
@@ -638,23 +565,28 @@ class MixtralAttention(nn.Layer):
 
         if config.tensor_parallel_degree > 1:
             self.o_proj = RowParallelLinear(
-                self.hidden_size,
+                self.config.num_attention_heads * self.head_dim,
                 self.hidden_size,
                 has_bias=False,
                 input_is_parallel=True,
             )
         else:
             self.o_proj = nn.Linear(
-                self.hidden_size,
+                self.config.num_attention_heads * self.head_dim,
                 self.hidden_size,
                 bias_attr=False,
             )
-
-        self.rotary_emb = MixtralRotaryEmbedding(
+        self.rotary_emb = GemmaRotaryEmbedding(
             self.head_dim,
             max_position_embeddings=self.max_position_embeddings,
             base=self.rope_theta,
         )
+
+        self.reshard_layer = None
+        if config.sep_parallel_degree > 1:
+            assert self.num_key_value_heads % config.sep_parallel_degree == 0
+            assert self.num_heads % config.sep_parallel_degree == 0
+            self.reshard_layer = ReshardLayer()
 
         self.config = config
 
@@ -666,43 +598,106 @@ class MixtralAttention(nn.Layer):
         attention_mask: Optional[paddle.Tensor] = None,
         output_attentions: bool = False,
         use_cache: bool = False,
+        alibi: Optional[paddle.Tensor] = None,
     ) -> Tuple[paddle.Tensor, Optional[paddle.Tensor], Optional[Tuple[paddle.Tensor]]]:
         """Input shape: Batch x Time x Channel"""
         # [bs, seq_len, num_head * head_dim] -> [seq_len / n, bs, num_head * head_dim] (n is model parallelism)
-
         query_states = self.q_proj(hidden_states)
         key_states = self.k_proj(hidden_states)
         value_states = self.v_proj(hidden_states)
-        if self.sequence_parallel:
-            target_query_shape = [-1, self.seq_length, self.num_heads, self.head_dim]
-            target_key_value_shape = [-1, self.seq_length, self.num_key_value_heads, self.head_dim]
+        if self.reshard_layer is not None:
+            if self.sequence_parallel:
+                assert self.seq_length % self.config.sep_parallel_degree == 0
+                query_states = paddle.reshape(
+                    query_states,
+                    [-1, self.seq_length // self.config.sep_parallel_degree, self.num_heads * self.head_dim],
+                )
+                key_states = paddle.reshape(
+                    key_states,
+                    [-1, self.seq_length // self.config.sep_parallel_degree, self.num_heads * self.head_dim],
+                )
+                value_states = paddle.reshape(
+                    value_states,
+                    [-1, self.seq_length // self.config.sep_parallel_degree, self.num_heads * self.head_dim],
+                )
+            query_states = self.reshard_layer(
+                query_states,
+                split_axis=2,
+                concat_axis=1,
+            )
+            key_states = self.reshard_layer(
+                key_states,
+                split_axis=2,
+                concat_axis=1,
+            )
+            value_states = self.reshard_layer(
+                value_states,
+                split_axis=2,
+                concat_axis=1,
+            )
+            query_states = paddle.reshape(
+                query_states, [0, self.seq_length, -1, self.head_dim]
+            )  # [bs, seq_len, num_head/k, head_dim], k is sep degree
+            key_states = paddle.reshape(key_states, [0, self.seq_length, -1, self.head_dim])
+            value_states = paddle.reshape(value_states, [0, self.seq_length, -1, self.head_dim])
         else:
-            target_query_shape = [0, 0, self.num_heads, self.head_dim]
-            target_key_value_shape = [0, 0, self.num_key_value_heads, self.head_dim]
-        query_states = query_states.reshape(shape=target_query_shape)
-        key_states = key_states.reshape(shape=target_key_value_shape)
-        value_states = value_states.reshape(shape=target_key_value_shape)
+            if self.sequence_parallel:
+                target_query_shape = [-1, self.seq_length, self.num_heads, self.head_dim]
+                target_key_value_shape = [-1, self.seq_length, self.num_key_value_heads, self.head_dim]
+            else:
+                target_query_shape = [0, 0, self.num_heads, self.head_dim]
+                target_key_value_shape = [0, 0, self.num_key_value_heads, self.head_dim]
+            query_states = query_states.reshape(shape=target_query_shape)
+            key_states = key_states.reshape(shape=target_key_value_shape)
+            value_states = value_states.reshape(shape=target_key_value_shape)
 
         kv_seq_len = key_states.shape[-3]
 
         if past_key_value is not None:
             kv_seq_len += past_key_value[0].shape[-3]
 
-        if self.use_fused_rope:
-            assert past_key_value is None, "fuse rotary not support cache kv for now"
-            cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
-            query_states, key_states, _ = fused_rotary_position_embedding(
-                query_states,
-                key_states,
-                v=None,
-                sin=sin,
-                cos=cos,
-                position_ids=position_ids,
-                use_neox_rotary_style=False,
-            )
-        else:
-            cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
-            query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+        if self.config.rope:
+            if self.reshard_layer is not None:
+                batch_size, seq_length, _, _ = query_states.shape
+                position_ids = paddle.arange(seq_length, dtype="int64").expand((batch_size, seq_length))
+            if self.use_fused_rope:
+                assert past_key_value is None, "fuse rotary not support cache kv for now"
+                cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
+                paddle_version = float(paddle.__version__[:3])
+                if ((paddle_version != 0.0) and (paddle_version <= 2.6)) and (
+                    self.num_heads != self.num_key_value_heads
+                ):
+                    query_states, _, _ = fused_rotary_position_embedding(
+                        query_states,
+                        None,
+                        None,
+                        sin=sin,
+                        cos=cos,
+                        position_ids=position_ids,
+                        use_neox_rotary_style=False,
+                    )
+                    key_states, _, _ = fused_rotary_position_embedding(
+                        key_states,
+                        None,
+                        None,
+                        sin=sin,
+                        cos=cos,
+                        position_ids=position_ids,
+                        use_neox_rotary_style=False,
+                    )
+                else:
+                    query_states, key_states, _ = fused_rotary_position_embedding(
+                        query_states,
+                        key_states,
+                        v=None,
+                        sin=sin,
+                        cos=cos,
+                        position_ids=position_ids,
+                        use_neox_rotary_style=False,
+                    )
+            else:
+                cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
+                query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
         # [bs, seq_len, num_head, head_dim]
         if past_key_value is not None:
@@ -712,10 +707,15 @@ class MixtralAttention(nn.Layer):
 
         past_key_value = (key_states, value_states) if use_cache else None
 
-        # TODO(wj-Mcat): use broadcast strategy when n_kv_heads = 1
-        # repeat k/v heads if n_kv_heads < n_heads
-        key_states = repeat_kv(key_states, self.num_key_value_groups)
-        value_states = repeat_kv(value_states, self.num_key_value_groups)
+        if self.kv_indices is not None:
+            key_states = paddle.index_select(key_states, self.kv_indices, axis=2)
+            value_states = paddle.index_select(value_states, self.kv_indices, axis=2)
+            key_states = paddle.broadcast_to(key_states, query_states.shape)
+            value_states = paddle.broadcast_to(value_states, query_states.shape)
+        else:
+            # repeat k/v heads if n_kv_heads < n_heads
+            key_states = repeat_kv(key_states, self.num_key_value_groups)
+            value_states = repeat_kv(value_states, self.num_key_value_groups)
 
         has_gradient = not (query_states.stop_gradient and key_states.stop_gradient and value_states.stop_gradient)
         if (
@@ -732,9 +732,12 @@ class MixtralAttention(nn.Layer):
                 value_states,
                 attention_mask,
                 output_attentions,
-                self.training,
+                alibi,
                 self.sequence_parallel,
+                reshard_layer=self.reshard_layer,
                 use_reentrant=self.config.recompute_use_reentrant,
+                attn_dropout_prob=self.attention_dropout,
+                trainer_mode=self.training,
             )
         else:
             outputs = scaled_dot_product_attention(
@@ -744,8 +747,11 @@ class MixtralAttention(nn.Layer):
                 value_states,
                 attention_mask,
                 output_attentions,
-                self.training,
+                alibi,
                 self.sequence_parallel,
+                reshard_layer=self.reshard_layer,
+                attn_dropout_prob=self.attention_dropout,
+                trainer_mode=self.training,
             )
         if output_attentions:
             attn_output, attn_weights = outputs
@@ -773,15 +779,15 @@ class MixtralAttention(nn.Layer):
         return outputs
 
 
-class MixtralDecoderLayer(nn.Layer):
+class GemmaDecoderLayer(nn.Layer):
     def __init__(self, config, layerwise_recompute: bool = False):
         super().__init__()
         self.config = config
         self.hidden_size = config.hidden_size
-        self.self_attn = MixtralAttention(config, layerwise_recompute)
-        self.block_sparse_moe = MixtralSparseMoeBlock(config)
-        self.input_layernorm = MixtralRMSNorm(config)
-        self.post_attention_layernorm = MixtralRMSNorm(config)
+        self.self_attn = GemmaAttention(config, layerwise_recompute)
+        self.mlp = GemmaMLP(config)
+        self.input_layernorm = GemmaRMSNorm(config)
+        self.post_attention_layernorm = GemmaRMSNorm(config)
         self.sequence_parallel = config.sequence_parallel
         # Note that we will actually perform a recompute only if both enable_recompute and layerwise_recompute are set to True
         # Enable_recompute defaults to False and is controlled by Trainer
@@ -795,9 +801,9 @@ class MixtralDecoderLayer(nn.Layer):
         position_ids: Optional[Tuple[paddle.Tensor]] = None,
         attention_mask: Optional[paddle.Tensor] = None,
         output_attentions: Optional[bool] = False,
-        output_router_logits: Optional[bool] = False,
         past_key_value: Optional[Tuple[paddle.Tensor]] = None,
         use_cache: Optional[bool] = False,
+        alibi: Optional[paddle.Tensor] = None,
     ) -> Tuple[paddle.Tensor, Optional[Tuple[paddle.Tensor, paddle.Tensor]]]:
         """
         Args:
@@ -807,9 +813,6 @@ class MixtralDecoderLayer(nn.Layer):
             output_attentions (`bool`, *optional*):
                 Whether or not to return the attentions tensors of all attention layers. See `attentions` under
                 returned tensors for more detail.
-            output_router_logits (`bool`, *optional*):
-                Whether or not to return the logits of all the routers. They are useful for computing the router loss, and
-                should not be returned during inference.
             use_cache (`bool`, *optional*):
                 If set to `True`, `cache` key value states are returned and can be used to speed up decoding
                 (see `cache`).
@@ -836,6 +839,7 @@ class MixtralDecoderLayer(nn.Layer):
                 attention_mask,
                 output_attentions,
                 use_cache,
+                alibi,
                 use_reentrant=self.config.recompute_use_reentrant,
             )
         else:
@@ -846,6 +850,7 @@ class MixtralDecoderLayer(nn.Layer):
                 attention_mask,
                 output_attentions,
                 use_cache,
+                alibi,
             )
 
         if type(outputs) is tuple:
@@ -864,7 +869,7 @@ class MixtralDecoderLayer(nn.Layer):
         # Fully Connected
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states, router_logits = self.block_sparse_moe(hidden_states)
+        hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
 
         outputs = (hidden_states,)
@@ -875,22 +880,23 @@ class MixtralDecoderLayer(nn.Layer):
         if use_cache:
             outputs += (present_key_value,)
 
-        if output_router_logits:
-            outputs += (router_logits,)
-
+        # remove empty tuple for pipeline parallel
         if type(outputs) is tuple and len(outputs) == 1:
             outputs = outputs[0]
 
         return outputs
 
 
-class MixtralPretrainedModel(PretrainedModel):
-    config_class = MixtralConfig
-    base_model_prefix = "mixtral"
-    _keys_to_ignore_on_load_unexpected = [r"self_attn.rotary_emb.inv_freq"]
+class GemmaPretrainedModel(PretrainedModel):
+    config_class = GemmaConfig
+    base_model_prefix = "gemma"
+    pretrained_init_configuration = GEMMA_PRETRAINED_INIT_CONFIGURATION
+    pretrained_resource_files_map = GEMMA_PRETRAINED_RESOURCE_FILES_MAP
+    _keys_to_ignore_on_load_unexpected = []
+    _keep_in_fp32_modules = ["inv_freq", "rotary_emb", "cos_cached", "sin_cached"]
 
     @classmethod
-    def _get_name_mappings(cls, config: MixtralConfig) -> list[StateDictNameMapping]:
+    def _get_name_mappings(cls, config: GemmaConfig) -> List[StateDictNameMapping]:
         mappings: list[StateDictNameMapping] = []
         model_mappings = [
             ["embed_tokens.weight"],
@@ -902,34 +908,26 @@ class MixtralPretrainedModel(PretrainedModel):
                 [f"layers.{layer_index}.self_attn.k_proj.weight", None, "transpose"],
                 [f"layers.{layer_index}.self_attn.v_proj.weight", None, "transpose"],
                 [f"layers.{layer_index}.self_attn.o_proj.weight", None, "transpose"],
-                [f"layers.{layer_index}.self_attn.rotary_emb.inv_freq"],
+                [f"layers.{layer_index}.mlp.gate_proj.weight", None, "transpose"],
+                [f"layers.{layer_index}.mlp.down_proj.weight", None, "transpose"],
+                [f"layers.{layer_index}.mlp.up_proj.weight", None, "transpose"],
                 [f"layers.{layer_index}.input_layernorm.weight"],
                 [f"layers.{layer_index}.post_attention_layernorm.weight"],
             ]
             model_mappings.extend(layer_mappings)
-
-            for expert_idx in range(config.num_local_experts):
-                expert_mappings = [
-                    [f"layers.{layer_index}.block_sparse_moe.experts.{expert_idx}.w1.weight", None, "transpose"],
-                    [f"layers.{layer_index}.block_sparse_moe.experts.{expert_idx}.w2.weight", None, "transpose"],
-                    [f"layers.{layer_index}.block_sparse_moe.experts.{expert_idx}.w3.weight", None, "transpose"],
-                ]
-                model_mappings.extend(expert_mappings)
-            model_mappings.append([f"layers.{layer_index}.block_sparse_moe.gate.weight", None, "transpose"])
-
         init_name_mappings(mappings=model_mappings)
-        # base-model prefix "MixtralModel"
-        if "MixtralModel" not in config.architectures:
+        # base-model prefix "GemmaModel"
+        if "GemmaModel" not in config.architectures:
             for mapping in model_mappings:
                 mapping[0] = "model." + mapping[0]
-                mapping[1] = "mixtral." + mapping[1]
+                mapping[1] = "gemma." + mapping[1]
             model_mappings.append(["lm_head.weight", "lm_head.weight", "transpose"])
 
         mappings = [StateDictNameMapping(*mapping, index=index) for index, mapping in enumerate(model_mappings)]
         return mappings
 
     @classmethod
-    def _get_tensor_parallel_mappings(cls, config: MixtralConfig, is_split=True):
+    def _get_tensor_parallel_mappings(cls, config: GemmaConfig, is_split=True):
 
         from paddlenlp.transformers.conversion_utils import split_or_merge_func
 
@@ -940,26 +938,35 @@ class MixtralPretrainedModel(PretrainedModel):
             num_attention_heads=config.num_attention_heads,
         )
 
-        def get_tensor_parallel_split_mappings(num_layers, num_local_experts):
+        def get_tensor_parallel_split_mappings(num_layers):
             final_actions = {}
 
             base_actions = {
-                "lm_head.weight": partial(fn, is_column=True),
+                # Column Linear
+                "lm_head.weight": partial(fn, is_column=not config.tie_word_embeddings),
                 # Row Linear
                 "embed_tokens.weight": partial(fn, is_column=False),
                 "layers.0.self_attn.o_proj.weight": partial(fn, is_column=False),
+                "layers.0.mlp.down_proj.weight": partial(fn, is_column=False),
             }
 
             if not config.vocab_size % config.tensor_parallel_degree == 0:
                 base_actions.pop("lm_head.weight")
                 base_actions.pop("embed_tokens.weight")
 
-            # Column Linear
             base_actions["layers.0.self_attn.q_proj.weight"] = partial(fn, is_column=True)
             # if we have enough num_key_value_heads to split, then split it.
             if config.num_key_value_heads % config.tensor_parallel_degree == 0:
                 base_actions["layers.0.self_attn.k_proj.weight"] = partial(fn, is_column=True)
                 base_actions["layers.0.self_attn.v_proj.weight"] = partial(fn, is_column=True)
+
+            if config.fuse_attention_ffn:
+                base_actions["layers.0.mlp.gate_up_fused_proj.weight"] = partial(
+                    fn, is_column=True, is_naive_2fuse=True
+                )
+            else:
+                base_actions["layers.0.mlp.gate_proj.weight"] = partial(fn, is_column=True)
+                base_actions["layers.0.mlp.up_proj.weight"] = partial(fn, is_column=True)
 
             for key, action in base_actions.items():
                 if "layers.0." in key:
@@ -967,22 +974,9 @@ class MixtralPretrainedModel(PretrainedModel):
                         final_actions[key.replace("layers.0.", f"layers.{i}.")] = action
                 final_actions[key] = action
 
-            # Add tp split for expert params.
-            base_actions = {
-                "layers.0.block_sparse_moe.experts.0.w1.weight": partial(fn, is_column=True),
-                "layers.0.block_sparse_moe.experts.0.w2.weight": partial(fn, is_column=False),
-                "layers.0.block_sparse_moe.experts.0.w3.weight": partial(fn, is_column=True),
-            }
-            for key, action in base_actions.items():
-                for i in range(num_layers):
-                    newkey = key.replace("layers.0.", f"layers.{i}.")
-                    for j in range(num_local_experts):
-                        newkey2 = newkey.replace("experts.0.", f"experts.{j}.")
-                        final_actions[newkey2] = action
-
             return final_actions
 
-        mappings = get_tensor_parallel_split_mappings(config.num_hidden_layers, config.num_local_experts)
+        mappings = get_tensor_parallel_split_mappings(config.num_hidden_layers)
 
         return mappings
 
@@ -998,7 +992,6 @@ class MixtralPretrainedModel(PretrainedModel):
                 mpu.VocabParallelEmbedding,
                 mpu.ColumnParallelLinear,
                 mpu.RowParallelLinear,
-                MixtralLMHead,
                 ColumnSequenceParallelLinear,
                 RowSequenceParallelLinear,
             ),
@@ -1013,7 +1006,7 @@ class MixtralPretrainedModel(PretrainedModel):
                                 mean=0.0,
                                 std=self.config.initializer_range
                                 if hasattr(self.config, "initializer_range")
-                                else self.mixtral.config.initializer_range,
+                                else self.gemma.config.initializer_range,
                                 shape=layer.weight.shape,
                             )
                         )
@@ -1023,7 +1016,7 @@ class MixtralPretrainedModel(PretrainedModel):
                             mean=0.0,
                             std=self.config.initializer_range
                             if hasattr(self.config, "initializer_range")
-                            else self.mixtral.config.initializer_range,
+                            else self.gemma.config.initializer_range,
                             shape=layer.weight.shape,
                         )
                     )
@@ -1031,23 +1024,23 @@ class MixtralPretrainedModel(PretrainedModel):
         # sublayer is init first
         # scale RowParallelLinear weight
         with paddle.no_grad():
-            if isinstance(layer, MixtralMLP):
+            if isinstance(layer, GemmaMLP):
                 factor = 1 / math.sqrt(2 * self.config.num_hidden_layers)
-                layer.w2.weight.scale_(factor)
-            if isinstance(layer, MixtralAttention):
+                layer.down_proj.weight.scale_(factor)
+            if isinstance(layer, GemmaAttention):
                 factor = 1 / math.sqrt(2 * self.config.num_hidden_layers)
                 layer.o_proj.weight.scale_(factor)
 
 
 @register_base_model
-class MixtralModel(MixtralPretrainedModel):
+class GemmaModel(GemmaPretrainedModel):
     """
-    Transformer decoder consisting of *config.num_hidden_layers* layers. Each layer is a [`MixtralDecoderLayer`]
+    Transformer decoder consisting of *config.num_hidden_layers* layers. Each layer is a [`GemmaDecoderLayer`]
     Args:
-        config: MixtralConfig
+        config: GemmaConfig
     """
 
-    def __init__(self, config: MixtralConfig):
+    def __init__(self, config: GemmaConfig):
         super().__init__(config)
         self.vocab_size = config.vocab_size
         self.hidden_size = config.hidden_size
@@ -1063,16 +1056,20 @@ class MixtralModel(MixtralPretrainedModel):
                 self.hidden_size,
                 weight_attr=paddle.ParamAttr(initializer=nn.initializer.XavierNormal()),
             )
+            self.embed_tokens.weight.is_distributed = True
         else:
             self.embed_tokens = nn.Embedding(
                 self.vocab_size,
                 self.hidden_size,
             )
+            self.embed_tokens.weight.is_distributed = False
 
         self.layers = nn.LayerList(
-            [MixtralDecoderLayer(config, i not in self.no_recompute_layers) for i in range(config.num_hidden_layers)]
+            [GemmaDecoderLayer(config, i not in self.no_recompute_layers) for i in range(config.num_hidden_layers)]
         )
-        self.norm = MixtralRMSNorm(config)
+        self.norm = GemmaRMSNorm(config)
+
+        self.gradient_checkpointing = False
 
     def get_input_embeddings(self):
         return self.embed_tokens
@@ -1089,8 +1086,7 @@ class MixtralModel(MixtralPretrainedModel):
                 # For decoding phase in generation, seq_length = 1, we don't need to add causal mask
                 if input_shape[-1] > 1:
                     combined_attention_mask = _make_causal_mask(
-                        input_shape,
-                        past_key_values_length=past_key_values_length,
+                        input_shape, past_key_values_length=past_key_values_length
                     )
                     expanded_attn_mask = expanded_attn_mask & combined_attention_mask
             # [bsz, seq_len, seq_len] -> [bsz, 1, seq_len, seq_len]
@@ -1100,10 +1096,7 @@ class MixtralModel(MixtralPretrainedModel):
             else:
                 expanded_attn_mask = attention_mask
         else:
-            expanded_attn_mask = _make_causal_mask(
-                input_shape,
-                past_key_values_length=past_key_values_length,
-            )
+            expanded_attn_mask = _make_causal_mask(input_shape, past_key_values_length=past_key_values_length)
         # Convert bool attention_mask to float attention mask, which will be added to attention_scores later
         expanded_attn_mask = paddle.where(expanded_attn_mask, 0.0, paddle.finfo(dtype).min).astype(dtype)
         return expanded_attn_mask
@@ -1116,9 +1109,9 @@ class MixtralModel(MixtralPretrainedModel):
         position_ids: Optional[Tensor],
         attention_mask: Tensor,
         output_attentions: bool,
-        output_router_logits: bool,
         past_key_value: Tensor,
         use_cache: bool,
+        alibi=None,
     ):
         def create_custom_forward(module):
             def custom_forward(*inputs):
@@ -1132,9 +1125,9 @@ class MixtralModel(MixtralPretrainedModel):
             position_ids,
             attention_mask,
             output_attentions,
-            output_router_logits,
             past_key_value,
             use_cache,
+            alibi,
             use_reentrant=self.config.recompute_use_reentrant,
         )
 
@@ -1143,14 +1136,13 @@ class MixtralModel(MixtralPretrainedModel):
     def forward(
         self,
         input_ids=None,
-        position_ids=None,
         attention_mask=None,
+        position_ids=None,
+        past_key_values=None,
         inputs_embeds=None,
         use_cache=None,
-        past_key_values=None,
         output_attentions=False,
         output_hidden_states=None,
-        output_router_logits: Optional[bool] = None,
         return_dict=False,
         **kwargs,
     ):
@@ -1160,9 +1152,6 @@ class MixtralModel(MixtralPretrainedModel):
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
-        )
-        output_router_logits = (
-            output_router_logits if output_router_logits is not None else self.config.output_router_logits
         )
         use_cache = use_cache if use_cache is not None else self.config.use_cache
 
@@ -1177,6 +1166,14 @@ class MixtralModel(MixtralPretrainedModel):
             batch_size, seq_length, _ = inputs_embeds.shape
         else:
             raise ValueError("You have to specify either decoder_input_ids or decoder_inputs_embeds")
+        if self.sequence_parallel:
+            # [bs, seq_len, num_head * head_dim] -> [bs * seq_len, num_head * head_dim]
+            bs, seq_len, hidden_size = inputs_embeds.shape
+            inputs_embeds = paddle.reshape_(inputs_embeds, [bs * seq_len, hidden_size])
+            # [seq_len * bs / n, num_head * head_dim] (n is mp parallelism)
+            inputs_embeds = ScatterOp.apply(inputs_embeds)
+        if inputs_embeds is None:
+            inputs_embeds = self.embed_tokens(input_ids)
 
         if past_key_values is None:
             past_key_values = tuple([None] * len(self.layers))
@@ -1188,20 +1185,28 @@ class MixtralModel(MixtralPretrainedModel):
         if past_key_values[0] is not None:
             cache_length = paddle.shape(past_key_values[0][0])[1]
             seq_length_with_past += cache_length
-        if inputs_embeds is None:
-            inputs_embeds = self.embed_tokens(input_ids)
 
-        if self.sequence_parallel:
-            # [bs, seq_len, num_head * head_dim] -> [bs * seq_len, num_head * head_dim]
-            bs, seq_len, hidden_size = inputs_embeds.shape
-            inputs_embeds = paddle.reshape_(inputs_embeds, [bs * seq_len, hidden_size])
-            # [seq_len * bs / n, num_head * head_dim] (n is mp parallelism)
-            inputs_embeds = ScatterOp.apply(inputs_embeds)
+        if position_ids is None:
+            position_ids = paddle.arange(seq_length, dtype="int64").expand((batch_size, seq_length))
 
-        # embed positions
         if attention_mask is None:
             # [bs, seq_len]
             attention_mask = paddle.ones((batch_size, seq_length_with_past), dtype=paddle.bool)
+        if self.config.alibi:
+            alibi = build_alibi_tensor(attention_mask, self.config.num_attention_heads, dtype=inputs_embeds.dtype)
+            if self.config.tensor_parallel_degree > 1:
+                block_size = self.config.num_attention_heads // self.config.tensor_parallel_degree
+                alibi = alibi[
+                    :,
+                    self.config.tensor_parallel_rank
+                    * block_size : (self.config.tensor_parallel_rank + 1)
+                    * block_size,
+                ]
+                alibi = alibi.reshape([batch_size * block_size, 1, seq_length_with_past])
+            else:
+                alibi = alibi.reshape([batch_size * self.config.num_attention_heads, 1, seq_length_with_past])
+        else:
+            alibi = None
 
         if position_ids is None:
             position_ids = paddle.arange(seq_length, dtype="int64").expand((batch_size, seq_length))
@@ -1211,14 +1216,18 @@ class MixtralModel(MixtralPretrainedModel):
         )  # [bs, 1, seq_len, seq_len]
         if self.config.use_flash_attention:
             is_casual = is_casual_mask(attention_mask)
-            if is_casual:
+            if is_casual and alibi is None:
                 attention_mask = None
+
+        # embed positions
         hidden_states = inputs_embeds
+
+        # normalized
+        hidden_states = hidden_states * (self.config.hidden_size**0.5)
 
         # decoder layers
         all_hidden_states = () if output_hidden_states else None
         all_self_attns = () if output_attentions else None
-        all_router_logits = () if output_router_logits else None
         next_decoder_cache = () if use_cache else None
 
         for idx, (decoder_layer) in enumerate(self.layers):
@@ -1239,9 +1248,9 @@ class MixtralModel(MixtralPretrainedModel):
                     position_ids,
                     attention_mask,
                     output_attentions,
-                    output_router_logits,
                     past_key_value,
                     use_cache,
+                    alibi=alibi,
                 )
             else:
                 layer_outputs = decoder_layer(
@@ -1249,9 +1258,9 @@ class MixtralModel(MixtralPretrainedModel):
                     position_ids,
                     attention_mask,
                     output_attentions,
-                    output_router_logits,
                     past_key_value,
                     use_cache,
+                    alibi=alibi,
                 )
 
             # NOTE: clear outdate cache after it has been used for memory saving
@@ -1267,9 +1276,6 @@ class MixtralModel(MixtralPretrainedModel):
             if use_cache:
                 next_decoder_cache += (layer_outputs[2 if output_attentions else 1],)
 
-            if output_router_logits:
-                all_router_logits += (layer_outputs[-1],)
-
         hidden_states = self.norm(hidden_states)
 
         # add hidden states from the last decoder layer
@@ -1279,29 +1285,25 @@ class MixtralModel(MixtralPretrainedModel):
         next_cache = next_decoder_cache if use_cache else None
 
         if not return_dict:
-            return tuple(
-                v
-                for v in [hidden_states, next_cache, all_hidden_states, all_self_attns, all_router_logits]
-                if v is not None
-            )
-        return MoEModelOutputWithPast(
+            return tuple(v for v in [hidden_states, next_cache, all_hidden_states, all_self_attns] if v is not None)
+        return BaseModelOutputWithPastAndCrossAttentions(
             last_hidden_state=hidden_states,
             past_key_values=next_cache,
             hidden_states=all_hidden_states,
             attentions=all_self_attns,
-            router_logits=all_router_logits,
+            cross_attentions=None,
         )
 
 
-class MixtralPretrainingCriterion(paddle.nn.Layer):
+class GemmaPretrainingCriterion(nn.Layer):
     """
-    Criterion for Mixtral.
+    Criterion for gemma. Copied From Llama
     It calculates the final loss.
     """
 
     def __init__(self, config):
 
-        super(MixtralPretrainingCriterion, self).__init__()
+        super().__init__()
         self.ignore_index = getattr(config, "ignore_index", -100)
         self.config = config
         self.enable_parallel_cross_entropy = config.tensor_parallel_degree > 1 and config.tensor_parallel_output
@@ -1322,6 +1324,9 @@ class MixtralPretrainingCriterion(paddle.nn.Layer):
         with paddle.amp.auto_cast(False):
             masked_lm_loss = self.loss_func(prediction_scores.astype("float32"), masked_lm_labels.unsqueeze(2))
 
+            if self.config.sep_parallel_degree > 1:
+                _hcg = fleet.get_hybrid_communicate_group()
+                masked_lm_loss = ConcatSePMaskedLoss.apply(masked_lm_loss, axis=1, group=_hcg.get_sep_parallel_group())
             # skip ignore_index which loss == 0
             masked_lm_loss = masked_lm_loss[masked_lm_loss > 0]
             loss = paddle.mean(masked_lm_loss)
@@ -1329,9 +1334,30 @@ class MixtralPretrainingCriterion(paddle.nn.Layer):
         return loss
 
 
-class MixtralLMHead(nn.Layer):
-    def __init__(self, config: MixtralConfig):
-        super(MixtralLMHead, self).__init__()
+class ConcatSePMaskedLoss(PyLayer):
+    @staticmethod
+    def forward(ctx, inp, axis, group):
+        inputs = []
+        paddle.distributed.all_gather(inputs, inp, group=group)
+        with paddle.no_grad():
+            cat = paddle.concat(inputs, axis=axis)
+        ctx.args_axis = axis
+        ctx.args_group = group
+        return cat
+
+    @staticmethod
+    def backward(ctx, grad):
+        axis = ctx.args_axis
+        group = ctx.args_group
+        with paddle.no_grad():
+            grads = paddle.split(grad, paddle.distributed.get_world_size(group), axis=axis)
+        grad = grads[paddle.distributed.get_rank(group)]
+        return grad
+
+
+class GemmaLMHead(nn.Layer):
+    def __init__(self, config: GemmaConfig):
+        super().__init__()
         self.config = config
         if config.tensor_parallel_degree > 1 and config.vocab_size % config.tensor_parallel_degree == 0:
             vocab_size = config.vocab_size // config.tensor_parallel_degree
@@ -1339,9 +1365,10 @@ class MixtralLMHead(nn.Layer):
             vocab_size = config.vocab_size
 
         self.weight = self.create_parameter(
-            shape=[config.hidden_size, vocab_size],
+            shape=[vocab_size, config.hidden_size] if config.tie_word_embeddings else [config.hidden_size, vocab_size],
             dtype=paddle.get_default_dtype(),
         )
+
         # Must set distributed attr for Tensor Parallel !
         self.weight.is_distributed = True if (vocab_size != config.vocab_size) else False
         if self.weight.is_distributed:
@@ -1351,58 +1378,52 @@ class MixtralLMHead(nn.Layer):
         if self.config.sequence_parallel:
             hidden_states = GatherOp.apply(hidden_states)
             seq_length = self.config.seq_length
+            if self.config.sep_parallel_degree > 1:
+                assert seq_length % self.config.sep_parallel_degree == 0
+                seq_length = seq_length // self.config.sep_parallel_degree
             hidden_states = paddle.reshape_(hidden_states, [-1, seq_length, self.config.hidden_size])
 
         if tensor_parallel_output is None:
             tensor_parallel_output = self.config.tensor_parallel_output
 
-        logits = parallel_matmul(hidden_states, self.weight, tensor_parallel_output=tensor_parallel_output)
+        logits = parallel_matmul(
+            hidden_states,
+            self.weight,
+            tensor_parallel_output=tensor_parallel_output,
+            transpose_y=self.config.tie_word_embeddings,
+        )
         return logits
 
 
-class MixtralForCausalLM(MixtralPretrainedModel):
+class GemmaForCausalLM(GemmaPretrainedModel):
     enable_to_static_method = True
 
     def __init__(self, config):
         super().__init__(config)
         self.config = config
+        self.lm_head = self.lm_head = GemmaLMHead(config)
+        self.gemma = GemmaModel(config)
+        self.criterion = GemmaPretrainingCriterion(config)
 
-        self.mixtral = MixtralModel(config)
-        self.lm_head = MixtralLMHead(config)
-        self.criterion = MixtralPretrainingCriterion(config)
-        self.router_aux_loss_coef = config.router_aux_loss_coef
-        self.num_experts = config.num_local_experts
-        self.num_experts_per_tok = config.num_experts_per_tok
-
-        if config.sliding_window is not None:
-            logger.warning("We do not support sliding window attention for now.")
+        self.tie_weights()
 
     def get_input_embeddings(self):
-        return self.mixtral.embed_tokens
-
-    def set_input_embeddings(self, value):
-        self.mixtral.embed_tokens = value
+        return self.gemma.embed_tokens
 
     def get_output_embeddings(self):
         return self.lm_head
 
-    def set_output_embeddings(self, new_embeddings):
-        self.lm_head = new_embeddings
+    def set_input_embeddings(self, value):
+        self.gemma.embed_tokens = value
 
     def set_decoder(self, decoder):
-        self.mixtral = decoder
+        self.gemma = decoder
 
     def get_decoder(self):
-        return self.mixtral
+        return self.gemma
 
     def prepare_inputs_for_generation(
-        self,
-        input_ids,
-        use_cache=False,
-        past_key_values=None,
-        inputs_embeds=None,
-        output_router_logits=False,
-        **kwargs
+        self, input_ids, use_cache=False, past_key_values=None, inputs_embeds=None, **kwargs
     ):
         batch_size, seq_length = input_ids.shape
         position_ids = kwargs.get("position_ids", paddle.arange(seq_length).expand((batch_size, seq_length)))
@@ -1423,7 +1444,6 @@ class MixtralForCausalLM(MixtralPretrainedModel):
                 "past_key_values": past_key_values,
                 "use_cache": use_cache,
                 "attention_mask": attention_mask,
-                "output_router_logits": output_router_logits,
             }
         )
         return model_inputs
@@ -1441,7 +1461,7 @@ class MixtralForCausalLM(MixtralPretrainedModel):
         if isinstance(outputs, tuple) and len(outputs) > 1 and not isinstance(outputs[1], paddle.Tensor):
             model_kwargs["past_key_values"] = outputs[1]
 
-        if isinstance(outputs, MoECausalLMOutputWithPast) and "past_key_values" in outputs:
+        if isinstance(outputs, CausalLMOutputWithCrossAttentions) and "past_key_values" in outputs:
             model_kwargs["past_key_values"] = outputs.past_key_values
 
         # update position_ids
@@ -1468,19 +1488,14 @@ class MixtralForCausalLM(MixtralPretrainedModel):
         past_key_values=None,
         output_attentions=None,
         output_hidden_states=None,
-        output_router_logits: Optional[bool] = None,
         return_dict=None,
     ):
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
-        output_router_logits = (
-            output_router_logits if output_router_logits is not None else self.config.output_router_logits
-        )
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-
-        outputs = self.mixtral(
+        outputs = self.gemma(
             input_ids,  # [bs, seq_len]
             position_ids=position_ids,
             attention_mask=attention_mask,
@@ -1489,7 +1504,6 @@ class MixtralForCausalLM(MixtralPretrainedModel):
             past_key_values=past_key_values,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
-            output_router_logits=output_router_logits,
             return_dict=return_dict,
         )
 
@@ -1507,29 +1521,14 @@ class MixtralForCausalLM(MixtralPretrainedModel):
         if labels is not None:
             loss = self.criterion(logits, labels)
 
-        aux_loss = None
-        if output_router_logits:
-            aux_loss = load_balancing_loss_func(
-                outputs.router_logits if return_dict else outputs[-1],
-                self.num_experts,
-                self.num_experts_per_tok,
-                attention_mask,
-            )
-            if labels is not None:
-                loss += self.router_aux_loss_coef * aux_loss
-
         if not return_dict:
             output = (logits,) + outputs[1:]
-            if output_router_logits:
-                output = (aux_loss,) + output
             return (loss,) + output if loss is not None else output
 
-        return MoECausalLMOutputWithPast(
+        return CausalLMOutputWithCrossAttentions(
             loss=loss,
-            aux_loss=aux_loss,
             logits=logits,
             past_key_values=outputs.past_key_values,
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
-            router_logits=outputs.router_logits,
         )
