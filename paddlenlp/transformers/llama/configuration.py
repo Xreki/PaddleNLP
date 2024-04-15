@@ -168,6 +168,8 @@ class LlamaConfig(PretrainedConfig):
         alibi=False,
         rope_scaling_factor=1.0,
         rope_scaling_type=None,
+        transformer_engine_backend: str = None,
+        use_fp8: bool = False,
         long_sequence_strategy_type=None,
         long_sequence_strategy_name=None,
         long_sequence_init_args=None,
@@ -211,6 +213,8 @@ class LlamaConfig(PretrainedConfig):
         self.use_fused_rope = use_fused_rope
         self.rope_scaling_factor = rope_scaling_factor
         self.rope_scaling_type = rope_scaling_type
+        self.transformer_engine_backend = transformer_engine_backend
+        self.use_fp8 = use_fp8
 
         self.long_sequence_strategy_type = long_sequence_strategy_type
         self.long_sequence_strategy_name = long_sequence_strategy_name

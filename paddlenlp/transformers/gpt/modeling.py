@@ -29,17 +29,23 @@ import paddle.tensor as tensor
 from paddle.distributed import fleet
 from paddle.distributed.fleet.meta_parallel import get_rng_state_tracker
 from paddle.distributed.fleet.utils import recompute
-from paddle.distributed.fleet.utils.sequence_parallel_utils import (
-    ColumnSequenceParallelLinear,
-    GatherOp,
-    RowSequenceParallelLinear,
-    ScatterOp,
-    mark_as_sequence_parallel_parameter,
-)
+
+try:
+    from paddle.distributed.fleet.utils.sequence_parallel_utils import (
+        ColumnSequenceParallelLinear,
+        GatherOp,
+        RowSequenceParallelLinear,
+        ScatterOp,
+        mark_as_sequence_parallel_parameter,
+    )
+except:
+    pass
 from paddle.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
+from paddle.utils import try_import
 
 from ...utils.converter import StateDictNameMapping
 from ...utils.log import logger
+from ...utils.transformer_engine_utils import TransformerEngineHelper
 from .. import PretrainedModel, register_base_model
 from ..model_outputs import (
     BaseModelOutputWithPastAndCrossAttentions,
@@ -48,7 +54,11 @@ from ..model_outputs import (
     TokenClassifierOutput,
 )
 from ..model_utils import dy2st_nocheck_guard_context
-from .configuration import GPT_PRETRAINED_INIT_CONFIGURATION, GPTConfig
+from .configuration import (
+    GPT_PRETRAINED_INIT_CONFIGURATION,
+    GPT_PRETRAINED_RESOURCE_FILES_MAP,
+    GPTConfig,
+)
 
 try:
     from paddle.nn.functional.flash_attention import flash_attention
@@ -58,6 +68,9 @@ try:
     from paddle.incubate.nn.layer.fused_dropout_add import FusedDropoutAdd
 except:
     FusedDropoutAdd = None
+
+OriginLayerNorm = paddle.nn.LayerNorm
+
 
 __all__ = [
     "GPTModel",
@@ -70,6 +83,7 @@ __all__ = [
     "GPTForCausalLM",
     "GPTEmbeddings",
     "GPTDecoderLayer",
+    "GPTLayerNorm",
 ]
 
 
@@ -119,6 +133,11 @@ def seed_guard_context(name=None):
         return contextlib.nullcontext()
 
 
+def fast_layer_norm(input, weight, bias, eps):
+    fast_ln_lib = try_import("fast_ln")
+    return fast_ln_lib.fast_ln(input, weight, bias, eps)[0]
+
+
 def _make_causal_mask(input_ids_shape, past_key_values_length):
     """
     Make causal mask used for self-attention
@@ -147,6 +166,11 @@ def _expand_2d_mask(mask, dtype, tgt_length):
     expanded_mask = mask.expand([batch_size, 1, tgt_length, src_length])
 
     return expanded_mask
+
+
+def _check_normalized_shape(normalized_shape):
+    if isinstance(normalized_shape, (list, tuple)):
+        assert len(normalized_shape) == 1
 
 
 class MultiHeadAttention(nn.Layer):
@@ -196,7 +220,7 @@ class MultiHeadAttention(nn.Layer):
                     3 * config.hidden_size,
                     has_bias=True,
                     gather_output=False,
-                    fuse_matmul_bias=config.fused_linear,
+                    fuse_matmul_bias=config.use_fused_linear,
                 )
             else:
                 self.q_proj = ColumnParallelLinear(
@@ -204,7 +228,7 @@ class MultiHeadAttention(nn.Layer):
                     config.hidden_size,
                     has_bias=True,
                     gather_output=False,
-                    fuse_matmul_bias=config.fused_linear,
+                    fuse_matmul_bias=config.use_fused_linear,
                 )
 
                 self.k_proj = ColumnParallelLinear(
@@ -212,7 +236,7 @@ class MultiHeadAttention(nn.Layer):
                     config.hidden_size,
                     has_bias=True,
                     gather_output=False,
-                    fuse_matmul_bias=config.fused_linear,
+                    fuse_matmul_bias=config.use_fused_linear,
                 )
 
                 self.v_proj = ColumnParallelLinear(
@@ -220,7 +244,7 @@ class MultiHeadAttention(nn.Layer):
                     config.hidden_size,
                     has_bias=True,
                     gather_output=False,
-                    fuse_matmul_bias=config.fused_linear,
+                    fuse_matmul_bias=config.use_fused_linear,
                 )
 
             self.out_proj = RowParallelLinear(
@@ -228,7 +252,7 @@ class MultiHeadAttention(nn.Layer):
                 config.hidden_size,
                 has_bias=True,
                 input_is_parallel=True,
-                fuse_matmul_bias=config.fused_linear,
+                fuse_matmul_bias=config.use_fused_linear,
             )
         else:
             if self.config.fuse_attention_qkv:
@@ -251,8 +275,12 @@ class MultiHeadAttention(nn.Layer):
         mix_layer = self.qkv_proj(query)
         # bs, seq_len, num_head, 3*head_dim
         mix_layer = paddle.reshape_(mix_layer, target_shape)
+
+        # transformer_engine's dot product attention only support input shape [bs, seq_len, 3, num_head, head_dim]
+        # so we also use this shape for paddle's dot product attention for better alignment
+        mix_layer = paddle.reshape_(mix_layer, [0, 0, 3 * self.num_attention_heads, self.head_dim])
         # query_states, key_states, value_states => bs, seq_len, num_head, head_dim
-        query_states, key_states, value_states = paddle.split(mix_layer, num_or_sections=3, axis=-1)
+        query_states, key_states, value_states = paddle.split(mix_layer, num_or_sections=3, axis=2)
 
         # [bs, seq_len, num_head, head_dim]
         if past_key_value is not None:
@@ -421,7 +449,7 @@ class TransformerDecoder(nn.Layer):
 
         self.config = config
         self.layers = decoder_layers
-        self.norm = nn.LayerNorm(config.hidden_size, epsilon=1e-5)
+        self.norm = GPTLayerNorm(config, config.hidden_size, epsilon=1e-5)
 
         if config.sequence_parallel:
             mark_as_sequence_parallel_parameter(self.norm.weight)
@@ -430,6 +458,12 @@ class TransformerDecoder(nn.Layer):
         # Note that we will actually perform a recompute only if both enable_recompute and layerwise_recompute are set to True
         # Enable_recompute defaults to False and is controlled by Trainer
         self.enable_recompute = False
+
+        self.use_fp8 = config.use_fp8
+        self.fp8_group = TransformerEngineHelper.get_fp8_group()
+
+        if config.transformer_engine_backend is not None:
+            self.enable_recompute = config.use_recompute
 
     @paddle.jit.not_to_static
     def recompute_training(
@@ -447,11 +481,13 @@ class TransformerDecoder(nn.Layer):
 
             return custom_forward
 
-        # GPTDecoderLayer
-        # def forward(
-        #     self, hidden_states, attention_mask=None, use_cache=False, past_key_value=None, output_attentions=False
-        # ):
-        hidden_states = recompute(
+        recompute_func = (
+            recompute
+            if self.config.transformer_engine_backend is None
+            else TransformerEngineHelper.get_te_recompute_func()
+        )
+
+        hidden_states = recompute_func(
             create_custom_forward(layer_module),
             hidden_states,
             attention_mask,
@@ -484,33 +520,34 @@ class TransformerDecoder(nn.Layer):
         all_hidden_states = () if output_hidden_states else None
         next_decoder_cache = () if use_cache else None
 
-        for i, mod in enumerate(self.layers):
-            has_gradient = not output.stop_gradient
-            # def forward(self, hidden_states, attention_mask=None, use_cache=False, past_key_value=None, output_attentions=False):
-            if self.enable_recompute and has_gradient and self.config.recompute_granularity == "full_attn":
-                outputs = self.recompute_training(
-                    layer_module=mod,
-                    hidden_states=output,
-                    attention_mask=attention_mask,
-                    use_cache=use_cache,
-                    past_key_value=None,
-                    output_attentions=output_attentions,
-                )
-            else:
-                outputs = mod(
-                    output,
-                    attention_mask=attention_mask,
-                    use_cache=use_cache,
-                    past_key_value=past_key_values[i] if past_key_values is not None else None,
-                    output_attentions=output_attentions,
-                )
+        with TransformerEngineHelper.fp8_autocast(enabled=self.use_fp8, fp8_group=self.fp8_group):
+            for i, mod in enumerate(self.layers):
+                has_gradient = not output.stop_gradient
+                # def forward(self, hidden_states, attention_mask=None, use_cache=False, past_key_value=None, output_attentions=False):
+                if self.enable_recompute and has_gradient and self.config.recompute_granularity == "full":
+                    outputs = self.recompute_training(
+                        layer_module=mod,
+                        hidden_states=output,
+                        attention_mask=attention_mask,
+                        use_cache=use_cache,
+                        past_key_value=None,
+                        output_attentions=output_attentions,
+                    )
+                else:
+                    outputs = mod(
+                        output,
+                        attention_mask=attention_mask,
+                        use_cache=use_cache,
+                        past_key_value=past_key_values[i] if past_key_values is not None else None,
+                        output_attentions=output_attentions,
+                    )
 
-            # outputs = hidden_states if both use_cache and output_attentions are False
-            # Otherwise, outputs = (hidden_states, attention if output_attentions, cache if use_cache)
-            output = outputs[0] if (use_cache or output_attentions) else outputs
-            all_self_attentions = all_self_attentions + (outputs[1],) if output_attentions else None
-            all_hidden_states = all_hidden_states + (output,) if output_hidden_states else None
-            next_decoder_cache = next_decoder_cache + (outputs[-1],) if use_cache else None
+                    # outputs = hidden_states if both use_cache and output_attentions are False
+                    # Otherwise, outputs = (hidden_states, attention if output_attentions, cache if use_cache)
+                    output = outputs[0] if (use_cache or output_attentions) else outputs
+                    all_self_attentions = all_self_attentions + (outputs[1],) if output_attentions else None
+                    all_hidden_states = all_hidden_states + (output,) if output_hidden_states else None
+                    next_decoder_cache = next_decoder_cache + (outputs[-1],) if use_cache else None
 
         if self.norm is not None:
             output = self.norm(output)
@@ -566,21 +603,23 @@ class GPTDecoderLayer(nn.Layer):
                 config.intermediate_size,
                 gather_output=False,
                 has_bias=True,
-                fuse_matmul_bias=self.config.fused_linear,
+                fuse_matmul_bias=self.config.use_fused_linear,
             )
+
             self.linear2 = RowParallelLinear(
                 config.intermediate_size,
                 config.hidden_size,
                 input_is_parallel=True,
                 has_bias=True,
-                fuse_matmul_bias=self.config.fused_linear,
+                fuse_matmul_bias=self.config.use_fused_linear,
             )
         else:
             self.linear1 = nn.Linear(config.hidden_size, config.intermediate_size, bias_attr=True)
             self.linear2 = nn.Linear(config.intermediate_size, config.hidden_size, bias_attr=True)
 
-        self.norm1 = nn.LayerNorm(config.hidden_size, epsilon=1e-5)
-        self.norm2 = nn.LayerNorm(config.hidden_size, epsilon=1e-5)
+        self.norm1 = GPTLayerNorm(config, config.hidden_size, epsilon=1e-5)
+        self.norm2 = GPTLayerNorm(config, config.hidden_size, epsilon=1e-5)
+
         if config.sequence_parallel:
             mark_as_sequence_parallel_parameter(self.norm1.weight)
             mark_as_sequence_parallel_parameter(self.norm1.bias)
@@ -679,6 +718,48 @@ class GPTDecoderLayer(nn.Layer):
         return tuple(v for v in temp_list if v is not None)
 
 
+class GPTDecoderLayerWithNVTEBackend(nn.Layer):
+    """
+    The transformer decoder layer using Transformer Backend.
+    """
+
+    def __init__(self, config: GPTConfig):
+
+        super(GPTDecoderLayerWithNVTEBackend, self).__init__()
+
+        self.config = config
+        TransformerLayer = TransformerEngineHelper.get_transformer_layer()
+        self.transformer = TransformerLayer(
+            hidden_size=config.hidden_size,
+            ffn_hidden_size=config.intermediate_size,
+            num_attention_heads=config.num_attention_heads,
+            hidden_dropout=config.hidden_dropout_prob,
+            attention_dropout=config.attention_probs_dropout_prob,
+            self_attn_mask_type="causal",
+            layer_type="encoder",
+            activation=config.hidden_activation,
+            set_parallel_mode=config.tensor_parallel_degree > 1,
+            sequence_parallel=self.config.sequence_parallel,
+            backend=config.transformer_engine_backend,
+        )
+
+    def forward(
+        self,
+        hidden_states,
+        attention_mask=None,
+        use_cache=False,
+        past_key_value=None,
+        output_attentions=False,
+        is_first_microbatch=None,
+    ):
+        return self.transformer(
+            hidden_states,
+            attention_mask,
+            recompute_core_attention=(self.config.use_recompute and self.config.recompute_granularity == "core_attn"),
+            is_first_microbatch=is_first_microbatch,
+        )
+
+
 class GPTEmbeddings(nn.Layer):
     """
     Include embeddings from word and position embeddings.
@@ -741,6 +822,21 @@ class GPTEmbeddings(nn.Layer):
         return embeddings
 
 
+class GPTLayerNorm(OriginLayerNorm):
+    def __init__(self, config, normalized_shape, epsilon=1e-05, weight_attr=None, bias_attr=None, name=None):
+        super().__init__(
+            normalized_shape=normalized_shape, epsilon=epsilon, weight_attr=weight_attr, bias_attr=bias_attr
+        )
+
+        self.config = config
+        _check_normalized_shape(self._normalized_shape)
+
+    def forward(self, input):
+        if self.config.use_fast_layer_norm:
+            return fast_layer_norm(input, self.weight, self.bias, self._epsilon)
+        return super().forward(input)
+
+
 class GPTPretrainedModel(PretrainedModel):
     """
     An abstract class for pretrained GPT models. It provides GPT related
@@ -755,6 +851,7 @@ class GPTPretrainedModel(PretrainedModel):
     base_model_prefix = "gpt"
     config_class = GPTConfig
     pretrained_init_configuration = GPT_PRETRAINED_INIT_CONFIGURATION
+    pretrained_resource_files_map = GPT_PRETRAINED_RESOURCE_FILES_MAP
 
     @classmethod
     def _get_tensor_parallel_mappings(cls, config, is_split=True):
@@ -916,6 +1013,8 @@ class GPTPretrainedModel(PretrainedModel):
                             shape=layer.weight.shape,
                         )
                     )
+        # If TE is enabled, init TE weights. Otherwise, do nothing.
+        TransformerEngineHelper.te_init_weights(layer, self.config)
         # Layer.apply is DFS https://github.com/PaddlePaddle/Paddle/blob/a6f5021fcc58b21f4414bae6bf4731ef6971582c/python/paddle/nn/layer/layers.py#L527-L530
         # sublayer is init first
         # scale RowParallelLinear weight
@@ -1005,9 +1104,13 @@ class GPTModel(GPTPretrainedModel):
 
         self.embeddings = GPTEmbeddings(config)
 
+        decoder_layer = (
+            GPTDecoderLayer if config.transformer_engine_backend is None else GPTDecoderLayerWithNVTEBackend
+        )
+
         decoder_layers = nn.LayerList()
         for i in range(config.num_hidden_layers):
-            decoder_layers.append(GPTDecoderLayer(config))
+            decoder_layers.append(decoder_layer(config))
 
         self.decoder = TransformerDecoder(
             config,

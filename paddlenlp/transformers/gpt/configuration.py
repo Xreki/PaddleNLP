@@ -18,9 +18,25 @@ from typing import Dict
 
 from paddlenlp.transformers.configuration_utils import PretrainedConfig
 
-__all__ = ["GPT_PRETRAINED_INIT_CONFIGURATION", "GPTConfig"]
+__all__ = ["GPT_PRETRAINED_INIT_CONFIGURATION", "GPTConfig", "GPT_PRETRAINED_RESOURCE_FILES_MAP"]
 
 GPT_PRETRAINED_INIT_CONFIGURATION = {
+    "gpt3-5B-en": {  # 5B
+        "vocab_size": 50304,
+        "hidden_size": 4096,
+        "num_hidden_layers": 24,
+        "num_attention_heads": 32,
+        "intermediate_size": 16384,
+        "hidden_act": "gelu",
+        "hidden_dropout_prob": 0.1,
+        "attention_probs_dropout_prob": 0.1,
+        "max_position_embeddings": 2048,
+        "type_vocab_size": 1,  # no use
+        "initializer_range": 0.02,
+        "eos_token_id": 50256,
+        "eol_token_id": 198,
+        "num_partitions": 1,
+    },
     "gpt-cpm-large-cn": {  # 2.6B
         "vocab_size": 30000,
         "hidden_size": 2560,
@@ -147,6 +163,17 @@ GPT_PRETRAINED_INIT_CONFIGURATION = {
     },
 }
 
+GPT_PRETRAINED_RESOURCE_FILES_MAP = {
+    "model_state": {
+        "gpt-cpm-large-cn": "https://bj.bcebos.com/paddlenlp/models/transformers/gpt/gpt-cpm-large-cn.pdparams",
+        "gpt-cpm-small-cn-distill": "https://bj.bcebos.com/paddlenlp/models/transformers/gpt/gpt-cpm-small-cn-distill.pdparams",
+        "gpt2-en": "https://bj.bcebos.com/paddlenlp/models/transformers/gpt/gpt2-en.pdparams",
+        "gpt2-medium-en": "https://bj.bcebos.com/paddlenlp/models/transformers/gpt/gpt2-medium-en.pdparams",
+        "gpt2-large-en": "https://bj.bcebos.com/paddlenlp/models/transformers/gpt/gpt2-large-en.pdparams",
+        "gpt2-xl-en": "https://bj.bcebos.com/paddlenlp/models/transformers/gpt/gpt2-xl-en.pdparams",
+    }
+}
+
 
 class GPTConfig(PretrainedConfig):
     r"""
@@ -257,13 +284,16 @@ class GPTConfig(PretrainedConfig):
         ignore_index: int = 0,
         use_flash_attention: bool = False,
         use_fused_dropout_add: bool = False,
-        fused_linear: bool = False,
+        use_fast_layer_norm: bool = False,
+        use_fused_linear: bool = False,
         fuse_attention_qkv: bool = False,
         fuse_attention_ffn: bool = False,
         fused_softmax_with_triangular: bool = False,
         virtual_pp_degree: int = 1,
         sequence_parallel=False,
         fuse_sequence_parallel_allreduce=False,
+        transformer_engine_backend: str = None,
+        use_fp8: bool = False,
         **kwargs
     ):
         super().__init__(pad_token_id=pad_token_id, **kwargs)
@@ -298,7 +328,8 @@ class GPTConfig(PretrainedConfig):
         self.tensor_parallel_output = tensor_parallel_output
         self.output_attentions = output_attentions
         self.ignore_index = ignore_index
-        self.fused_linear = fused_linear
+        self.use_fast_layer_norm = use_fast_layer_norm
+        self.use_fused_linear = use_fused_linear
         self.use_fused_dropout_add = use_fused_dropout_add
         self.fused_softmax_with_triangular = fused_softmax_with_triangular
         self.virtual_pp_degree = virtual_pp_degree
@@ -309,3 +340,5 @@ class GPTConfig(PretrainedConfig):
             assert (
                 self.tensor_parallel_degree > 1
             ), f"senquence-parallel only works in mp, got mp={self.tensor_parallel_degree}"
+        self.transformer_engine_backend = transformer_engine_backend
+        self.use_fp8 = use_fp8
