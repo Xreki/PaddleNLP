@@ -27,6 +27,7 @@
 #include <sstream>
 
 #include "cutlass/array.h"
+#include "cutlass/trace.h"
 #include "cutlass/gemm/device/gemm_grouped.h"
 #include "cutlass/gemm/kernel/default_gemm_grouped.h"
 #include "cutlass/numeric_conversion.h"
@@ -42,12 +43,13 @@
 #pragma GCC diagnostic pop
 
 #include "helper.h"
+#include "wint_type_traits.h"
 #include "paddle/phi/kernels/fusion/cutlass/cutlass_kernels/cutlass_heuristic.h"
 #include "paddle/phi/kernels/fusion/cutlass/cutlass_kernels/gemm_config_manager.h"
 
 using namespace phi;
-// ============================= Variable batched Gemm things
-// ===========================
+
+// ======================= Variable batched Gemm things =====================
 template <typename T,
           typename WeightType,
           typename arch,
@@ -64,6 +66,7 @@ void generic_moe_gemm_kernelLauncher(const T* A,
                                      int64_t gemm_n,
                                      int64_t gemm_k,
                                      int num_experts,
+                                     wintx::WintQuantMethod quant_method,
                                      CutlassGemmConfig gemm_config,
                                      const int multi_processor_count,
                                      cudaStream_t stream,
@@ -87,41 +90,24 @@ void generic_moe_gemm_kernelLauncher(const T* A,
   static_assert(
       cutlass::platform::is_same<T, WeightType>::value ||
           cutlass::platform::is_same<WeightType, uint8_t>::value ||
-          cutlass::platform::is_same<WeightType, cutlass::uint4b_t>::value,
-      "");
+          cutlass::platform::is_same<WeightType, cutlass::uint4b_t>::value ||
+          cutlass::platform::is_same<WeightType, uint16_t>::value,
+      "Specialized for bfloat16, half, float, uint8_t (wint8), uint4b_t (wint4), uint16_t (wint2.5)");
 
   // The cutlass type for the input elements. This is needed to convert to
   // cutlass::half_t if necessary.
-  using ElementType_ = typename cutlass::platform::conditional<
-      cutlass::platform::is_same<T, half>::value,
-      cutlass::half_t,
-      T>::type;
-#ifdef PADDLE_CUDA_BF16
-  using ElementType = typename cutlass::platform::conditional<
-      cutlass::platform::is_same<ElementType_, __nv_bfloat16>::value,
-      cutlass::bfloat16_t,
-      ElementType_>::type;
-#else
-  using ElementType = ElementType_;
-#endif
-
-  using CutlassWeightType_ = typename cutlass::platform::conditional<
-      cutlass::platform::is_same<WeightType, half>::value,
-      cutlass::half_t,
-      WeightType>::type;
-#ifdef PADDLE_CUDA_BF16
-  using CutlassWeightType = typename cutlass::platform::conditional<
-      cutlass::platform::is_same<CutlassWeightType_, __nv_bfloat16>::value,
-      cutlass::bfloat16_t,
-      CutlassWeightType_>::type;
-#else
-  using CutlassWeightType = CutlassWeightType_;
-#endif
+  using ElementType = typename wintx::CutlassDataType<T>::Type;
+  using CutlassWeightType = typename wintx::CutlassDataType<WeightType>::Type;
+  using CutlassMmaWeightType = typename wintx::CutlassMmaTraits<ElementType, WeightType>::MmaWeightType;
+  
+  CUTLASS_TRACE_HOST("ElementType: " << wintx::GetCutlassDataTypeString<ElementType>());
+  CUTLASS_TRACE_HOST("CutlassWeightType: " << wintx::GetCutlassDataTypeString<CutlassWeightType>());
+  CUTLASS_TRACE_HOST("CutlassMmaWeightType: " << wintx::GetCutlassDataTypeString<CutlassMmaWeightType>());
 
   // We need separate config for each architecture since we will target
   // different tensorcore instructions. For float, we do not target TCs.
   using MixedGemmArchTraits = cutlass::gemm::kernel::
-      MixedGemmArchTraits<ElementType, CutlassWeightType, arch>;
+      MixedGemmArchTraits<ElementType, CutlassMmaWeightType, arch>;
   using ElementAccumulator = typename MixedGemmArchTraits::AccType;
 
   using EpilogueOp = typename Epilogue<ElementType,
@@ -135,7 +121,7 @@ void generic_moe_gemm_kernelLauncher(const T* A,
       cutlass::layout::RowMajor,
       cutlass::ComplexTransform::kNone,
       MixedGemmArchTraits::ElementsPerAccessA,
-      CutlassWeightType,
+      CutlassMmaWeightType,
       typename MixedGemmArchTraits::LayoutB,
       cutlass::ComplexTransform::kNone,
       MixedGemmArchTraits::ElementsPerAccessB,
@@ -175,6 +161,7 @@ void generic_moe_gemm_kernelLauncher(const T* A,
         "GroupedGEMM kernel");
   }
   const int threadblock_count = multi_processor_count * occupancy;
+  CUTLASS_TRACE_HOST("kernel_occupancy: " << kernel_occupancy << ", occupancy: " << occupancy << ", threadblock_count: " << threadblock_count << ", multi_processor_count: " << multi_processor_count);
 
   typename EpilogueOp::Params epilogue_op(ElementAccumulator(1.f),
                                           ElementAccumulator(0.f));
@@ -184,13 +171,14 @@ void generic_moe_gemm_kernelLauncher(const T* A,
       threadblock_count,
       epilogue_op,
       reinterpret_cast<const ElementType*>(A),
-      reinterpret_cast<const CutlassWeightType*>(B),
+      reinterpret_cast<const CutlassMmaWeightType*>(B),
       reinterpret_cast<const ElementType*>(weight_scales),
       reinterpret_cast<const ElementType*>(biases),
       reinterpret_cast<ElementType*>(C),
       total_rows_before_expert,
       gemm_n,
-      gemm_k);
+      gemm_k,
+      quant_method);
 
   GemmGrouped gemm;
 
@@ -236,6 +224,7 @@ struct dispatch_stages {
                        int64_t gemm_n,
                        int64_t gemm_k,
                        int num_experts,
+                       wintx::WintQuantMethod quant_method,
                        CutlassGemmConfig gemm_config,
                        int multi_processor_count,
                        cudaStream_t stream,
@@ -270,6 +259,7 @@ struct dispatch_stages<T,
                        int64_t gemm_n,
                        int64_t gemm_k,
                        int num_experts,
+                       wintx::WintQuantMethod quant_method,
                        CutlassGemmConfig gemm_config,
                        int multi_processor_count,
                        cudaStream_t stream,
@@ -289,6 +279,7 @@ struct dispatch_stages<T,
                                        gemm_n,
                                        gemm_k,
                                        num_experts,
+                                       quant_method,
                                        gemm_config,
                                        multi_processor_count,
                                        stream,
@@ -319,10 +310,12 @@ struct dispatch_stages<T,
                        int64_t gemm_n,
                        int64_t gemm_k,
                        int num_experts,
+                       wintx::WintQuantMethod quant_method,
                        CutlassGemmConfig gemm_config,
                        int multi_processor_count,
                        cudaStream_t stream,
                        int* occupancy = nullptr) {
+    CUTLASS_TRACE_HOST("Stages: " << Stages);
     generic_moe_gemm_kernelLauncher<T,
                                     WeightType,
                                     cutlass::arch::Sm80,
@@ -338,6 +331,7 @@ struct dispatch_stages<T,
                                             gemm_n,
                                             gemm_k,
                                             num_experts,
+                                            quant_method,
                                             gemm_config,
                                             multi_processor_count,
                                             stream,
@@ -360,6 +354,7 @@ void dispatch_gemm_config(const T* A,
                           int64_t gemm_n,
                           int64_t gemm_k,
                           int num_experts,
+                          wintx::WintQuantMethod quant_method,
                           CutlassGemmConfig gemm_config,
                           int multi_processor_count,
                           cudaStream_t stream,
@@ -381,6 +376,7 @@ void dispatch_gemm_config(const T* A,
                                      gemm_n,                   \
                                      gemm_k,                   \
                                      num_experts,              \
+                                     quant_method,             \
                                      gemm_config,              \
                                      multi_processor_count,    \
                                      stream,                   \
@@ -404,6 +400,7 @@ void dispatch_gemm_config(const T* A,
 #define dispatch_gemm_config_macro(AA, BB, CC, DD, EE, FF)      \
   case CutlassTileConfig::                                      \
       CtaShape##AA##x##BB##x##CC##_WarpShape##DD##x##EE##x##FF: \
+    CUTLASS_TRACE_HOST("ThreadblockShape<" << AA << "," << BB << "," << CC << ">, WarpShape<" << DD << "," << EE << "," << FF << ">"); \
     dispatch_gemm_config<T,                                     \
                          WeightType,                            \
                          arch,                                  \
@@ -419,6 +416,7 @@ void dispatch_gemm_config(const T* A,
         gemm_n,                                                 \
         gemm_k,                                                 \
         num_experts,                                            \
+        quant_method,                                           \
         gemm_config,                                            \
         multi_processor_count,                                  \
         stream,                                                 \
@@ -444,6 +442,7 @@ void dispatch_moe_gemm_to_cutlass(const T* A,
                                   int64_t gemm_n,
                                   int64_t gemm_k,
                                   int num_experts,
+                                  wintx::WintQuantMethod quant_method,
                                   CutlassGemmConfig gemm_config,
                                   int sm_version,
                                   int multi_processor_count,
@@ -490,6 +489,7 @@ void dispatch_moe_gemm_to_cutlass(const T* A,
                                   int64_t gemm_n,
                                   int64_t gemm_k,
                                   int num_experts,
+                                  wintx::WintQuantMethod quant_method,
                                   CutlassGemmConfig gemm_config,
                                   int sm_version,
                                   int multi_processor_count,
@@ -562,6 +562,7 @@ void dispatch_moe_gemm_to_cutlass(const T* A,
                                   int64_t gemm_n,
                                   int64_t gemm_k,
                                   int num_experts,
+                                  wintx::WintQuantMethod quant_method,
                                   CutlassGemmConfig gemm_config,
                                   int sm_version,
                                   int multi_processor_count,
@@ -609,6 +610,7 @@ void MoeGemmRunner<T, WeightType>::dispatch_to_arch<EpilogueTag>(
     int64_t gemm_n,
     int64_t gemm_k,
     int num_experts,
+    wintx::WintQuantMethod quant_method,
     CutlassGemmConfig gemm_config,
     cudaStream_t stream,
     int* occupancy) {
@@ -624,6 +626,7 @@ void MoeGemmRunner<T, WeightType>::dispatch_to_arch<EpilogueTag>(
       gemm_n,                                                     \
       gemm_k,                                                     \
       num_experts,                                                \
+      quant_method,                                               \
       gemm_config,                                                \
       sm_,                                                        \
       multi_processor_count_,                                     \
@@ -635,6 +638,7 @@ void MoeGemmRunner<T, WeightType>::dispatch_to_arch<EpilogueTag>(
   } else if (sm_ >= 75 && sm_ < 80) {
     dispatch_moe_gemm_to_cutlass_macro(cutlass::arch::Sm75);
   } else if (sm_ >= 80 && sm_ < 91) {
+    CUTLASS_TRACE_HOST("Call dispatch_moe_gemm_to_cutlass with cutlass::arch::Sm80.")
     dispatch_moe_gemm_to_cutlass_macro(cutlass::arch::Sm80);
   } else {
     PADDLE_FATAL("[MoE][GEMM Dispatch] Arch unsupported for MoE GEMM");
@@ -654,11 +658,14 @@ void MoeGemmRunner<T, WeightType>::run_gemm<EpilogueTag>(
     int64_t gemm_n,
     int64_t gemm_k,
     int num_experts,
+    wintx::WintQuantMethod quant_method,
     cudaStream_t stream) {
   static constexpr bool is_weight_only = !std::is_same<T, WeightType>::value;
   static constexpr bool only_simt_configs = std::is_same<T, float>::value;
+  CUTLASS_TRACE_HOST("sm: " << sm_ << ", is_weight_only: " << is_weight_only << ", only_simt_configs: " << only_simt_configs);
   std::vector<CutlassGemmConfig> candidate_configs =
       get_candidate_configs(sm_, -1, is_weight_only, only_simt_configs, true);
+  CUTLASS_TRACE_HOST("get_candidate_configs(): number of candidate_configs: " << candidate_configs.size());
   static constexpr int warm_time = 5;
   static constexpr int test_time = 10;
   auto& gemmConfigManager = GemmConfigManager::Instance();
@@ -670,6 +677,7 @@ void MoeGemmRunner<T, WeightType>::run_gemm<EpilogueTag>(
   auto chosen_config_optional =
       gemmConfigManager.getBestConfig(gemmId, total_rows);
   if (chosen_config_optional != std::nullopt) {
+    CUTLASS_TRACE_HOST("chosen_config_optional is not nullptr.");
     chosen_config = chosen_config_optional.value();
   } else {
     float best_time = std::numeric_limits<float>::max();
@@ -691,6 +699,7 @@ void MoeGemmRunner<T, WeightType>::run_gemm<EpilogueTag>(
                                         gemm_n,
                                         gemm_k,
                                         num_experts,
+                                        quant_method,
                                         candidate_configs[ii],
                                         stream);
         }
@@ -711,6 +720,7 @@ void MoeGemmRunner<T, WeightType>::run_gemm<EpilogueTag>(
                                         gemm_n,
                                         gemm_k,
                                         num_experts,
+                                        quant_method,
                                         candidate_configs[ii],
                                         stream);
         }
@@ -720,6 +730,7 @@ void MoeGemmRunner<T, WeightType>::run_gemm<EpilogueTag>(
         check_cuda_error(cudaEventElapsedTime(&elapsed, start, stop));
         check_cuda_error(cudaEventDestroy(start));
         check_cuda_error(cudaEventDestroy(stop));
+        CUTLASS_TRACE_HOST("find best_config: config " << ii << ", time: " << elapsed << " ms");
         if (elapsed < best_time) {
           best_time = elapsed;
           best_config = candidate_configs[ii];
@@ -747,6 +758,7 @@ void MoeGemmRunner<T, WeightType>::run_gemm<EpilogueTag>(
                                 gemm_n,
                                 gemm_k,
                                 num_experts,
+                                quant_method,
                                 chosen_config,
                                 stream);
 }
@@ -763,6 +775,7 @@ void MoeGemmRunner<T, WeightType>::moe_gemm_bias_act(
     int64_t gemm_n,
     int64_t gemm_k,
     int num_experts,
+    wintx::WintQuantMethod quant_method,
     std::string activation_type,
     cudaStream_t stream) {
   if (activation_type == "none") {
@@ -777,6 +790,7 @@ void MoeGemmRunner<T, WeightType>::moe_gemm_bias_act(
                                gemm_n,
                                gemm_k,
                                num_experts,
+                               quant_method,
                                stream);
     } else {
       run_gemm<EpilogueOpNoBias>(A,
@@ -789,6 +803,7 @@ void MoeGemmRunner<T, WeightType>::moe_gemm_bias_act(
                                  gemm_n,
                                  gemm_k,
                                  num_experts,
+                                 quant_method,
                                  stream);
     }
   }
@@ -804,7 +819,9 @@ void MoeGemmRunner<T, WeightType>::moe_gemm(const T* A,
                                             int64_t gemm_n,
                                             int64_t gemm_k,
                                             int num_experts,
+                                            wintx::WintQuantMethod quant_method,
                                             cudaStream_t stream) {
+  CUTLASS_TRACE_HOST("total_rows: " << total_rows << ", gemm_n: " << gemm_n << ", gemm_k: " << gemm_k << ", num_experts: " << num_experts);
   run_gemm<EpilogueOpNoBias>(A,
                              B,
                              weight_scales,
@@ -815,5 +832,6 @@ void MoeGemmRunner<T, WeightType>::moe_gemm(const T* A,
                              gemm_n,
                              gemm_k,
                              num_experts,
+                             quant_method,
                              stream);
 }

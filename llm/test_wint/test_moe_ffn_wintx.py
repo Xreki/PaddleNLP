@@ -42,7 +42,7 @@ def load_all_tensors(tensor_names, dump_dir):
 
 
 def test_main_wint4(i=1, test_dir=None):
-    dump_dir = os.join.path(test_dir, "dump_moe_ffn_wint4")
+    dump_dir = os.path.join(test_dir, "dump_moe_ffn_wint4")
     tensor_names = [
         f"permute_input_layer{i}",
         f"token_nums_per_expert_layer{i}",
@@ -120,32 +120,47 @@ def test_main_wint2_5(test_dir):
         "fused_moe_out.pdparams",
     ]
     tensor_dict = load_all_tensors(tensor_names, dump_dir)
+    print(f"tokens_per_experts: {tensor_dict['tokens_per_experts']}")
 
     ffn1_weights_scale = tensor_dict["ffn1_weights_scale"][:, 0, :]
     ffn2_weights_scale = tensor_dict["ffn2_weights_scale"][:, 0, :]
 
-    topk = 8
-    fused_moe_wintx_decode_wint2_5(
-        hidden_states=tensor_dict["gate_input"],
-        w1=tensor_dict["ffn1_weights"],
-        w2=tensor_dict["ffn2_weights"],
-        scores=tensor_dict["scores"],
-        topk=topk,
-        w1_scale=ffn1_weights_scale,
-        w2_scale=ffn2_weights_scale,
-    )
+    test_triton = False
+    if test_triton:
+        topk = 8
+        fused_moe_wintx_decode_wint2_5(
+            hidden_states=tensor_dict["gate_input"],
+            w1=tensor_dict["ffn1_weights"],
+            w2=tensor_dict["ffn2_weights"],
+            scores=tensor_dict["scores"],
+            topk=topk,
+            w1_scale=ffn1_weights_scale,
+            w2_scale=ffn2_weights_scale,
+        )
+    else:
+        quant_type = "weight_only_int2.5"
+        ffn_out = moe_expert_ffn(
+            tensor_dict["permute_input"],
+            tensor_dict["tokens_per_experts"],
+            tensor_dict["ffn1_weights"],
+            tensor_dict["ffn2_weights"],
+            None,
+            ffn1_weights_scale,
+            ffn2_weights_scale,
+            quant_type,
+        )
 
 
 def test_main():
     test_dir = "/work/models/PaddleNLP/llm/test_wint"
     # quant_type = "weight_only_int4"
-    # quant_type = "weight_only_int275"
-    quant_type = "weight_only_int25"
+    # quant_type = "weight_only_int2.75"
+    quant_type = "weight_only_int2.5"
     if quant_type == "weight_only_int4":
         test_main_wint4(test_dir=test_dir)
-    elif quant_type == "weight_only_int275":
+    elif quant_type == "weight_only_int2.75":
         test_main_wint2_75(test_dir=test_dir)
-    elif quant_type == "weight_only_int25":
+    elif quant_type == "weight_only_int2.5":
         test_main_wint2_5(test_dir=test_dir)
     else:
         print(f"Unsupport quant_type ({quant_type}).")

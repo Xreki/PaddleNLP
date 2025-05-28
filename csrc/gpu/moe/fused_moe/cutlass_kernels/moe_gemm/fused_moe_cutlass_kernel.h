@@ -44,6 +44,8 @@
 
 #include "cutlass_extensions/gemm/kernel/gemm_moe_problem_visitor.h"
 #include "paddle/phi/kernels/fusion/cutlass/cutlass_extensions/tile_interleaved_layout.h"
+#include "wint_type_traits.h"
+
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
 namespace cutlass {
@@ -79,6 +81,7 @@ CUTLASS_DEVICE static void run_mma(Mma mma,
                                    MatrixCoord scale_extent,
                                    const int thread_idx,
                                    MatrixCoord tb_offset_scale) {
+  CUTLASS_TRACE_DEVICE(" iterator_Scale, weight_scale_ptr=%p", weight_scale_ptr);                                  
   typename Mma::IteratorScale iterator_scale(
       Mma::IteratorScale::Layout(scale_extent.column()),
       weight_scale_ptr,
@@ -208,6 +211,8 @@ struct MoeFCGemm {
     int64_t gemm_n;
     int64_t gemm_k;
 
+    wintx::WintQuantMethod quant_method;
+
     // Only used by device-level operator
     GemmCoord* host_problem_sizes;
 
@@ -228,6 +233,7 @@ struct MoeFCGemm {
           total_rows_before_expert(nullptr),
           gemm_n(0),
           gemm_k(0),
+          quant_method(wintx::WintQuantMethod::kNone),
           host_problem_sizes(nullptr) {}
 
     /// Ctor
@@ -243,6 +249,7 @@ struct MoeFCGemm {
               int64_t* total_rows_before_expert,
               int64_t gemm_n,
               int64_t gemm_k,
+              wintx::WintQuantMethod quant_method,
               GemmCoord* host_problem_sizes = nullptr)
         : problem_count(problem_count),
           threadblock_count(threadblock_count),
@@ -255,11 +262,20 @@ struct MoeFCGemm {
           total_rows_before_expert(total_rows_before_expert),
           gemm_n(gemm_n),
           gemm_k(gemm_k),
+          quant_method(quant_method),
           host_problem_sizes(nullptr) {
       if (platform::is_same<uint8_t, ElementB>::value ||
           platform::is_same<uint4b_t, ElementB>::value) {
         assert(weight_scales);
       }
+    
+      CUTLASS_TRACE_HOST("[Arguments] problem_count: " << problem_count << ", threadblock_count: " << threadblock_count << ", gemm_n: " << gemm_n << ", gemm_k: " << gemm_k);
+      CUTLASS_TRACE_HOST("[Arguments] ptr_A: " << static_cast<void const*>(ptr_A));
+      CUTLASS_TRACE_HOST("[Arguments] ptr_B: " << static_cast<void const*>(ptr_B));
+      CUTLASS_TRACE_HOST("[Arguments] ptr_C: " << static_cast<void const*>(ptr_C));
+      CUTLASS_TRACE_HOST("[Arguments] ptr_D: " << static_cast<void*>(ptr_D));
+      CUTLASS_TRACE_HOST("[Arguments] weight_scales: " << static_cast<void const*>(weight_scales));
+      CUTLASS_TRACE_HOST("[Arguments] total_rows_before_expert: " << static_cast<void*>(total_rows_before_expert));
     }
   };
 
@@ -280,6 +296,8 @@ struct MoeFCGemm {
     ElementC* ptr_C;
     ElementC* ptr_D;
 
+    wintx::WintQuantMethod quant_method;
+
     //
     // Methods
     //
@@ -290,7 +308,8 @@ struct MoeFCGemm {
           ptr_B(nullptr),
           weight_scales(nullptr),
           ptr_C(nullptr),
-          ptr_D(nullptr) {}
+          ptr_D(nullptr),
+          quant_method(wintx::WintQuantMethod::kNone) {}
 
     CUTLASS_HOST_DEVICE
     Params(Arguments const& args,
@@ -308,7 +327,8 @@ struct MoeFCGemm {
           ptr_B(args.ptr_B),
           weight_scales(args.weight_scales),
           ptr_C(args.ptr_C),
-          ptr_D(args.ptr_D) {}
+          ptr_D(args.ptr_D),
+          quant_method(args.quant_method) {}
 
     CUTLASS_HOST_DEVICE
     void update(Arguments const& args,
@@ -328,6 +348,7 @@ struct MoeFCGemm {
       weight_scales = args.weight_scales;
       ptr_C = args.ptr_C;
       ptr_D = args.ptr_D;
+      quant_method = args.quant_method;
     }
   };
 
@@ -352,7 +373,7 @@ struct MoeFCGemm {
   }
 
   static Status can_implement(Arguments const& args) {
-    if (platform::is_same<uint8_t, ElementB>::value ||
+    if (args.quant_method != wintx::WintQuantMethod::kNone || platform::is_same<uint8_t, ElementB>::value ||
         platform::is_same<uint4b_t, ElementB>::value) {
       if (args.weight_scales == nullptr) {
         CUTLASS_TRACE_HOST(
@@ -395,6 +416,8 @@ struct MoeFCGemm {
       // These types shadow the type-level definitions and support the ability
       // to implement a 'transposed' GEMM that computes the transposed problems.
       //
+      CUTLASS_TRACE_DEVICE(" MoeFCGemm::KernelRunner::run_kernel()");
+
       using ElementA = typename Mma::IteratorA::Element;
       using LayoutA = typename Mma::IteratorA::Layout;
       using ElementB = typename Mma::IteratorB::Element;
@@ -420,15 +443,18 @@ struct MoeFCGemm {
       const int64_t gemm_n = params.problem_visitor.gemm_n;
       int64_t bytes_per_expert_matrix =
           (gemm_k * gemm_n / 8) * cutlass::sizeof_bits<ElementB>::value;
+      CUTLASS_TRACE_DEVICE(" gemm_k: %ld, gemm_n: %ld, bytes_per_expert_matrix: %ld, kInterleave: %d", gemm_k, gemm_n, bytes_per_expert_matrix, kInterleave);
 
       // Outer 'persistent' loop to iterate over tiles
       while (problem_visitor.next_tile()) {
         GemmCoord problem_size = problem_visitor.problem_size();
         int32_t problem_idx = problem_visitor.problem_index();
         int32_t cta_idx = int32_t(problem_visitor.threadblock_idx());
+        CUTLASS_TRACE_DEVICE(" problem_idx: %d, cta_idx: %d", problem_idx, cta_idx);
 
         GemmCoord grid_shape = problem_visitor.grid_shape(problem_size);
 
+        // threadblock_offset of C
         cutlass::gemm::GemmCoord threadblock_offset(
             int(cta_idx / grid_shape.n()) * Mma::Shape::kM,  // NOLINT
             int(cta_idx % grid_shape.n()) * Mma::Shape::kN,  // NOLINT
@@ -440,10 +466,12 @@ struct MoeFCGemm {
             problem_idx == 0
                 ? 0
                 : params.problem_visitor.last_row_for_problem[problem_idx - 1];
+        // begin address offset for A for current tile
         ElementA* ptr_A =
             reinterpret_cast<ElementA*>(params.ptr_A) + rows_to_jump * gemm_k;
         typename LayoutA::LongIndex ldm_A = gemm_k;
 
+        // begin address offset for B for current problem_idx, totally num_experts problems
         char* byte_ptr_B = ((char*)params.ptr_B) +                 // NOLINT
                            problem_idx * bytes_per_expert_matrix;  // NOLINT
         ElementB* ptr_B = reinterpret_cast<ElementB*>(byte_ptr_B);
@@ -453,26 +481,31 @@ struct MoeFCGemm {
                 : gemm_k * kInterleave;
 
         // Compute initial location in logical coordinates
+        // the begin threadblock_offset of A, which holds the same row id with C
         cutlass::MatrixCoord tb_offset_A{
             threadblock_offset.m(),
             0,
         };
 
+        // the begin threadblock_offset of B, which holds the same column id with C
         cutlass::MatrixCoord tb_offset_B{0,
                                          threadblock_offset.n() / kInterleave};
 
+        // the begin threadblock_offset of scale, which holds the same column id with C, but with no row id
         cutlass::MatrixCoord tb_offset_scale{0, threadblock_offset.n()};
 
         // Compute position within threadblock
         int thread_idx = threadIdx.x;
 
         // Construct iterators to A and B operands
+        CUTLASS_TRACE_DEVICE(" iterator_A, ptr_A=%p, ldm_A=%ld", ptr_A, ldm_A);
         typename Mma::IteratorA iterator_A(LayoutA(ldm_A),
                                            ptr_A,
                                            {problem_size.m(), problem_size.k()},
                                            thread_idx,
                                            tb_offset_A);
 
+        CUTLASS_TRACE_DEVICE(" iterator_B, ptr_B=%p, ldm_B=%ld", ptr_B, ldm_B);
         typename Mma::IteratorB iterator_B(
             LayoutB(ldm_B),
             ptr_B,
@@ -545,6 +578,7 @@ struct MoeFCGemm {
         typename Epilogue::OutputTileIterator::Params params_D(layout_D);
 
         // Tile iterator loading from source tensor.
+        CUTLASS_TRACE_DEVICE(" iterator_C, ptr_C=%p", ptr_C);
         typename Epilogue::OutputTileIterator iterator_C(
             params_C,
             ptr_C,
@@ -553,6 +587,7 @@ struct MoeFCGemm {
             threadblock_offset.mn());
 
         // Tile iterator writing to destination tensor.
+        CUTLASS_TRACE_DEVICE(" iterator_D, ptr_D=%p", ptr_D);
         typename Epilogue::OutputTileIterator iterator_D(
             params_D,
             ptr_D,

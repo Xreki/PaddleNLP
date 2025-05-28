@@ -40,21 +40,29 @@ void MoeFFNKernel(const paddle::Tensor& permute_input,
   auto fp16_moe_gemm_runner = MoeGemmRunner<DataType_, DataType_>();
   auto int8_moe_gemm_runner = MoeGemmRunner<DataType_, uint8_t>();
   auto int4_moe_gemm_runner = MoeGemmRunner<DataType_, cutlass::uint4b_t>();
+  auto int25_moe_gemm_runner = MoeGemmRunner<DataType_, uint16_t>();
 
   const int64_t expanded_active_expert_rows = permute_input.dims()[0];
   const int num_experts = ffn1_weight.dims()[0];
-  const int hidden_size = ffn1_weight.dims()[1];
-  int inter_dim = ffn1_weight.dims()[2];
+  int64_t hidden_dim = ffn1_weight.dims()[1];
+  int64_t inter_dim = ffn1_weight.dims()[2];
 
   if (quant_method == "weight_only_int4") {
+    // ffn1_weight compresses 2 int4 weights into 1 int8 along the last dimension.
     inter_dim = inter_dim * 2;
   }
-
   const int64_t inter_size = inter_dim;
 
-  paddle::Tensor fc1_out_tensor = GetEmptyTensor(
-      {expanded_active_expert_rows, inter_size}, input_type, place);
-  auto fc1_out = fc1_out_tensor.data<data_t>();
+  if (quant_method == "weight_only_int2.5") {
+    // ffn1_weight compresses 7 int3 weights into a int16 along the last dimension.
+    hidden_dim = hidden_dim * 64 / 10;
+  }
+  const int64_t hidden_size = hidden_dim;
+
+  // paddle::Tensor fc1_out_tensor = GetEmptyTensor(
+  //     {expanded_active_expert_rows, inter_size}, input_type, place);
+  // auto fc1_out = fc1_out_tensor.data<data_t>();
+  auto fc1_out = ffn_out_data;
 
   using NvType = typename traits_::DataType;
 
@@ -76,6 +84,7 @@ void MoeFFNKernel(const paddle::Tensor& permute_input,
         inter_size,
         hidden_size,
         num_experts,
+        wintx::WintQuantMethod::kWeightOnlyInt8,
         "none",
         stream);
   } else if (quant_method == "weight_only_int4") {
@@ -91,6 +100,23 @@ void MoeFFNKernel(const paddle::Tensor& permute_input,
         inter_size,
         hidden_size,
         num_experts,
+        wintx::WintQuantMethod::kWeightOnlyInt4,
+        "none",
+        stream);
+  } else if (quant_method == "weight_only_int2.5") {
+    int25_moe_gemm_runner.moe_gemm_bias_act(
+        reinterpret_cast<const NvType*>(permuted_data),
+        reinterpret_cast<const uint16_t*>(ffn1_weight.data<int16_t>()),
+        reinterpret_cast<const NvType*>(
+            const_cast<paddle::Tensor*>(ffn1_scale.get_ptr())->data<data_t>()),
+        reinterpret_cast<const NvType*>(fc1_expert_biases),
+        reinterpret_cast<NvType*>(fc1_out),
+        const_cast<int64_t*>(tokens_expert_prefix_sum.data<int64_t>()),
+        expanded_active_expert_rows,
+        inter_size,
+        hidden_size,
+        num_experts,
+        wintx::WintQuantMethod::kWeightOnlyInt25,
         "none",
         stream);
   } else {
@@ -105,10 +131,12 @@ void MoeFFNKernel(const paddle::Tensor& permute_input,
         inter_size,
         hidden_size,
         num_experts,
+        wintx::WintQuantMethod::kNone,
         "none",
         stream);
   }
 
+#if 0
   auto act_out_tensor = paddle::experimental::swiglu(fc1_out_tensor, nullptr);
   auto act_out = act_out_tensor.data<data_t>();
 
@@ -152,6 +180,7 @@ void MoeFFNKernel(const paddle::Tensor& permute_input,
         num_experts,
         stream);
   }
+#endif
 }
 
 std::vector<paddle::Tensor> MoeExpertFFN(
@@ -203,7 +232,10 @@ std::vector<std::vector<int64_t>> MoeExpertFFNInferShape(
     const paddle::optional<std::vector<int64_t>>& ffn1_bias_shape,
     const paddle::optional<std::vector<int64_t>>& ffn1_scale_shape,
     const paddle::optional<std::vector<int64_t>>& ffn2_scale_shape) {
-  return {permute_input_shape};
+  int64_t expanded_active_expert_rows = permute_input_shape[0];
+  int64_t inter_size = ffn1_scale_shape.get()[1];
+  return {std::vector<int64_t>{expanded_active_expert_rows, inter_size}};
+  // return {permute_input_shape};
 }
 
 std::vector<paddle::DataType> MoeExpertFFNInferDtype(

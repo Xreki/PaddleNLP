@@ -85,10 +85,10 @@ def get_gencode_flags():
         return [
             "-gencode",
             "arch=compute_80,code=sm_80",
-            "-gencode",
-            "arch=compute_75,code=sm_75",
-            "-gencode",
-            "arch=compute_70,code=sm_70",
+            # "-gencode",
+            # "arch=compute_75,code=sm_75",
+            # "-gencode",
+            # "arch=compute_70,code=sm_70",
         ]
 
 
