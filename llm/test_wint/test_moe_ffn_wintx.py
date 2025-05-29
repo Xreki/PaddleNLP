@@ -120,7 +120,7 @@ def test_main_wint2_5(test_dir):
         "fused_moe_out.pdparams",
     ]
     tensor_dict = load_all_tensors(tensor_names, dump_dir)
-    print(f"tokens_per_experts: {tensor_dict['tokens_per_experts']}")
+    # print(f"tokens_per_experts: {tensor_dict['tokens_per_experts']}")
 
     ffn1_weights_scale = tensor_dict["ffn1_weights_scale"][:, 0, :]
     ffn2_weights_scale = tensor_dict["ffn2_weights_scale"][:, 0, :]

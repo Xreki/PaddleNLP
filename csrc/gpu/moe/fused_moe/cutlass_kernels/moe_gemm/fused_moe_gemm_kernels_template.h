@@ -100,8 +100,8 @@ void generic_moe_gemm_kernelLauncher(const T* A,
   using CutlassWeightType = typename wintx::CutlassDataType<WeightType>::Type;
   using CutlassMmaWeightType = typename wintx::CutlassMmaTraits<ElementType, WeightType>::MmaWeightType;
   
-  CUTLASS_TRACE_HOST("ElementType: " << wintx::GetCutlassDataTypeString<ElementType>());
-  CUTLASS_TRACE_HOST("CutlassWeightType: " << wintx::GetCutlassDataTypeString<CutlassWeightType>());
+  CUTLASS_TRACE_HOST("A: " << A << ", ElementType: " << wintx::GetCutlassDataTypeString<ElementType>());
+  CUTLASS_TRACE_HOST("B: " << B << ", CutlassWeightType: " << wintx::GetCutlassDataTypeString<CutlassWeightType>());
   CUTLASS_TRACE_HOST("CutlassMmaWeightType: " << wintx::GetCutlassDataTypeString<CutlassMmaWeightType>());
 
   // We need separate config for each architecture since we will target

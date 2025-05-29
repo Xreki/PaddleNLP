@@ -193,7 +193,11 @@ std::vector<paddle::Tensor> MoeExpertFFN(
     const paddle::optional<paddle::Tensor>& ffn2_scale,
     const std::string& quant_method) {
   const auto input_type = permute_input.dtype();
-  auto ffn_out = paddle::empty_like(permute_input);
+  // auto ffn_out = paddle::empty_like(permute_input);
+  auto place = permute_input.place();
+  int64_t expanded_active_expert_rows = permute_input.dims()[0];
+  int64_t inter_size = ffn1_scale.get().dims()[1];
+  auto ffn_out = GetEmptyTensor({expanded_active_expert_rows, inter_size}, input_type, place);
 
   switch (input_type) {
     case paddle::DataType::BFLOAT16:
@@ -207,6 +211,7 @@ std::vector<paddle::Tensor> MoeExpertFFN(
                                                quant_method,
                                                ffn_out);
       break;
+#if 0
     case paddle::DataType::FLOAT16:
       MoeFFNKernel<paddle::DataType::FLOAT16>(permute_input,
                                               tokens_expert_prefix_sum,
@@ -218,6 +223,7 @@ std::vector<paddle::Tensor> MoeExpertFFN(
                                               quant_method,
                                               ffn_out);
       break;
+#endif
     default:
       PD_THROW("Unsupported data type for MoeExpertFFN");
   }
@@ -234,6 +240,7 @@ std::vector<std::vector<int64_t>> MoeExpertFFNInferShape(
     const paddle::optional<std::vector<int64_t>>& ffn2_scale_shape) {
   int64_t expanded_active_expert_rows = permute_input_shape[0];
   int64_t inter_size = ffn1_scale_shape.get()[1];
+  std::cout << "expanded_active_expert_rows: " << expanded_active_expert_rows << ", inter_size: " << inter_size << std::endl;
   return {std::vector<int64_t>{expanded_active_expert_rows, inter_size}};
   // return {permute_input_shape};
 }

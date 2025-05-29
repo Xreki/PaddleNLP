@@ -43,6 +43,7 @@
 #include "cutlass/trace.h"
 
 #include "cutlass_extensions/gemm/kernel/gemm_moe_problem_visitor.h"
+#include "cutlass_kernels/moe_gemm/tile_dequanter.h"
 #include "paddle/phi/kernels/fusion/cutlass/cutlass_extensions/tile_interleaved_layout.h"
 #include "wint_type_traits.h"
 
@@ -65,6 +66,22 @@ struct use_dq_gemm : platform::false_type {};
 template <typename Mma>
 struct use_dq_gemm<Mma, void_t<typename Mma::IteratorScale>>
     : platform::true_type {};
+
+template <typename KernelArch>
+constexpr bool NeedCompile() {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 700) && (__CUDA_ARCH__ < 750)
+  return platform::is_same<KernelArch, arch::Sm70>::value;
+#elif defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 750) && (__CUDA_ARCH__ < 800)
+  return platform::is_same<KernelArch, arch::Sm75>::value;
+#elif defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800) && (__CUDA_ARCH__ < 900)
+  return platform::is_same<KernelArch, arch::Sm80>::value;
+#elif defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900) && (__CUDA_ARCH__ < 910)
+  return platform::is_same<KernelArch, arch::Sm80>::value;
+#else
+  CUTLASS_NOT_IMPLEMENTED();
+  return false;
+#endif
+}
 
 // SFINAE overload for dequantizing gemm
 template <
@@ -112,6 +129,7 @@ CUTLASS_DEVICE static void run_mma(Mma mma,
                                    MatrixCoord scale_extent,
                                    const int thread_idx,
                                    MatrixCoord tb_offset_scale) {
+  CUTLASS_TRACE_DEVICE(" use_dq_gemm is false");                                    
   mma(gemm_k_iterations, accum, iterator_A, iterator_B, src_accum);
 }
 
@@ -276,6 +294,10 @@ struct MoeFCGemm {
       CUTLASS_TRACE_HOST("[Arguments] ptr_D: " << static_cast<void*>(ptr_D));
       CUTLASS_TRACE_HOST("[Arguments] weight_scales: " << static_cast<void const*>(weight_scales));
       CUTLASS_TRACE_HOST("[Arguments] total_rows_before_expert: " << static_cast<void*>(total_rows_before_expert));
+      CUTLASS_TRACE_HOST("[Arguments] quant_method: " << static_cast<int>(quant_method));
+      CUTLASS_TRACE_HOST("[Arguments] LayoutA: " << wintx::GetCutlassLayoutString<LayoutA>());
+      CUTLASS_TRACE_HOST("[Arguments] LayoutB: " << wintx::GetCutlassLayoutString<LayoutB>());
+      CUTLASS_TRACE_HOST("[Arguments] LayoutC: " << wintx::GetCutlassLayoutString<LayoutC>());
     }
   };
 
@@ -398,7 +420,7 @@ struct MoeFCGemm {
   // The dummy template parameter is not used and exists so that we can compile
   // this code using a standard earlier than C++17. Prior to C++17, fully
   // specialized templates HAD to exists in a namespace
-  template <bool B, typename dummy = void>
+  template <wintx::WintQuantMethod QuantMethod, bool B, typename dummy = void>
   struct KernelRunner {
     CUTLASS_DEVICE
     static void run_kernel(Params const& params,
@@ -407,8 +429,8 @@ struct MoeFCGemm {
     }
   };
 
-  template <typename dummy>
-  struct KernelRunner<true, dummy> {
+  template <wintx::WintQuantMethod QuantMethod, typename dummy>
+  struct KernelRunner<QuantMethod, true, dummy> {
     CUTLASS_DEVICE
     static void run_kernel(Params const& params,
                            SharedStorage& shared_storage) {  // NOLINT
@@ -424,6 +446,8 @@ struct MoeFCGemm {
       using LayoutB = typename Mma::IteratorB::Layout;
       using ElementC = typename Epilogue::OutputTileIterator::Element;
       using LayoutC = typename Epilogue::OutputTileIterator::Layout;
+      using PackedElementB = typename wintx::WintTypeTraits<QuantMethod>::WeightType;
+
       static constexpr int kInterleave =
           Mma::IteratorB::Shape::kRow / Mma::Shape::kK;
       static_assert(
@@ -433,6 +457,16 @@ struct MoeFCGemm {
                   kInterleave >= 1,
           "B must be row major/col major OR col major interleaved.");
 
+      CUTLASS_TRACE_DEVICE("SharedStorage Information:");
+      CUTLASS_TRACE_DEVICE(" ProblemVisitor::SharedStorage: %d bytes", static_cast<int>(sizeof(ProblemVisitor::SharedStorage)));
+      CUTLASS_TRACE_DEVICE(" Mma::SharedStorage: %d bytes", static_cast<int>(sizeof(Mma::SharedStorage)));
+      CUTLASS_TRACE_DEVICE(" Epilogue::SharedStorage: %d bytes", static_cast<int>(sizeof(Epilogue::SharedStorage)));
+      
+      // LayoutB should be RowMajor
+      using TileDequanterB = TileDequanter<ElementB, ThreadblockShape::kK, ThreadblockShape::kN, QuantMethod>;
+      __shared__ typename TileDequanterB::SharedStorage dequant_storage_B;
+      CUTLASS_TRACE_DEVICE(" TileDequanter::SharedStorage: %d bytes", static_cast<int>(sizeof(dequant_storage_B)));
+
       //
       // Problem visitor.
       //
@@ -441,8 +475,10 @@ struct MoeFCGemm {
 
       const int64_t gemm_k = params.problem_visitor.gemm_k;
       const int64_t gemm_n = params.problem_visitor.gemm_n;
-      int64_t bytes_per_expert_matrix =
-          (gemm_k * gemm_n / 8) * cutlass::sizeof_bits<ElementB>::value;
+      // kWeightOnlyInt25 is quantized and packed along k dimension with group_size 64.
+      const int64_t packed_gemm_k = QuantMethod == wintx::WintQuantMethod::kWeightOnlyInt25 ? wintx::WintTypeTraits<QuantMethod>::CaclPackedDim(gemm_k) : gemm_k;
+      int64_t bytes_per_expert_matrix = (packed_gemm_k * gemm_n / 8) * cutlass::sizeof_bits<PackedElementB>::value;
+
       CUTLASS_TRACE_DEVICE(" gemm_k: %ld, gemm_n: %ld, bytes_per_expert_matrix: %ld, kInterleave: %d", gemm_k, gemm_n, bytes_per_expert_matrix, kInterleave);
 
       // Outer 'persistent' loop to iterate over tiles
@@ -450,7 +486,8 @@ struct MoeFCGemm {
         GemmCoord problem_size = problem_visitor.problem_size();
         int32_t problem_idx = problem_visitor.problem_index();
         int32_t cta_idx = int32_t(problem_visitor.threadblock_idx());
-        CUTLASS_TRACE_DEVICE(" problem_idx: %d, cta_idx: %d", problem_idx, cta_idx);
+        CUTLASS_TRACE_DEVICE(" problem_idx: %d, cta_idx: %d, problem_size: {%d, %d, %d}",
+            problem_idx, cta_idx, static_cast<int>(problem_size.m()), static_cast<int>(problem_size.n()), static_cast<int>(problem_size.k()));
 
         GemmCoord grid_shape = problem_visitor.grid_shape(problem_size);
 
@@ -471,15 +508,6 @@ struct MoeFCGemm {
             reinterpret_cast<ElementA*>(params.ptr_A) + rows_to_jump * gemm_k;
         typename LayoutA::LongIndex ldm_A = gemm_k;
 
-        // begin address offset for B for current problem_idx, totally num_experts problems
-        char* byte_ptr_B = ((char*)params.ptr_B) +                 // NOLINT
-                           problem_idx * bytes_per_expert_matrix;  // NOLINT
-        ElementB* ptr_B = reinterpret_cast<ElementB*>(byte_ptr_B);
-        typename LayoutB::LongIndex ldm_B =
-            platform::is_same<layout::RowMajor, LayoutB>::value
-                ? gemm_n
-                : gemm_k * kInterleave;
-
         // Compute initial location in logical coordinates
         // the begin threadblock_offset of A, which holds the same row id with C
         cutlass::MatrixCoord tb_offset_A{
@@ -487,9 +515,24 @@ struct MoeFCGemm {
             0,
         };
 
+        // begin address offset for B for current problem_idx, totally num_experts problems
+        char* byte_ptr_B = ((char*)params.ptr_B) +                 // NOLINT
+                           problem_idx * bytes_per_expert_matrix;  // NOLINT
+      
+        typename LayoutB::LongIndex ldm_B =
+            platform::is_same<layout::RowMajor, LayoutB>::value
+                ? gemm_n
+                : gemm_k * kInterleave;
+        typename LayoutB::LongIndex ldm_B_shared = TileDequanterB::kColumns;
+
         // the begin threadblock_offset of B, which holds the same column id with C
         cutlass::MatrixCoord tb_offset_B{0,
                                          threadblock_offset.n() / kInterleave};
+
+        cutlass::MatrixCoord extent_B{problem_size.k() * kInterleave, problem_size.n() / kInterleave};
+        cutlass::MatrixCoord extent_B_shared{TileDequanterB::kRows, TileDequanterB::kColumns};
+
+        ElementB* ptr_B = TileDequanterB::Run(byte_ptr_B, dequant_storage_B, nullptr, ldm_B, tb_offset_B);
 
         // the begin threadblock_offset of scale, which holds the same column id with C, but with no row id
         cutlass::MatrixCoord tb_offset_scale{0, threadblock_offset.n()};
@@ -507,11 +550,11 @@ struct MoeFCGemm {
 
         CUTLASS_TRACE_DEVICE(" iterator_B, ptr_B=%p, ldm_B=%ld", ptr_B, ldm_B);
         typename Mma::IteratorB iterator_B(
-            LayoutB(ldm_B),
+            LayoutB(TileDequanterB::kPreDequantToSharedMemory ? ldm_B_shared : ldm_B),
             ptr_B,
-            {problem_size.k() * kInterleave, problem_size.n() / kInterleave},
+            TileDequanterB::kPreDequantToSharedMemory ? extent_B_shared : extent_B,
             thread_idx,
-            tb_offset_B);
+            TileDequanterB::kPreDequantToSharedMemory ? cutlass::make_Coord(0, 0) : tb_offset_B);
 
         typename Mma::FragmentC accumulators;
 
@@ -541,6 +584,7 @@ struct MoeFCGemm {
         // Compute threadblock-scoped matrix multiply-add
         int gemm_k_iterations =
             (problem_size.k() + Mma::Shape::kK - 1) / Mma::Shape::kK;
+        CUTLASS_TRACE_DEVICE(" gemm_k: %d, gemm_k_iterations: %d", problem_size.k(), gemm_k_iterations);
 
         // Wait for all threads to finish their epilogue phases from the
         // previous tile.
@@ -615,25 +659,20 @@ struct MoeFCGemm {
   CUTLASS_DEVICE
   void operator()(Params const& params,
                   SharedStorage& shared_storage) {  // NOLINT
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 700) && (__CUDA_ARCH__ < 750)
-    static constexpr bool compile_needed =
-        platform::is_same<KernelArch, arch::Sm70>::value;
-    KernelRunner<compile_needed>::run_kernel(params, shared_storage);
-#elif defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 750) && (__CUDA_ARCH__ < 800)
-    static constexpr bool compile_needed =
-        platform::is_same<KernelArch, arch::Sm75>::value;
-    KernelRunner<compile_needed>::run_kernel(params, shared_storage);
-#elif defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800) && (__CUDA_ARCH__ < 900)
-    static constexpr bool compile_needed =
-        platform::is_same<KernelArch, arch::Sm80>::value;
-    KernelRunner<compile_needed>::run_kernel(params, shared_storage);
-#elif defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900) && (__CUDA_ARCH__ < 910)
-    static constexpr bool compile_needed =
-        platform::is_same<KernelArch, arch::Sm80>::value;
-    KernelRunner<compile_needed>::run_kernel(params, shared_storage);
-#else
-    CUTLASS_NOT_IMPLEMENTED();
-#endif
+    static constexpr bool kCompileNeeded = NeedCompile<KernelArch>();
+    if constexpr (std::is_same<ElementB, cutlass::bfloat16_t>::value || std::is_same<ElementB, cutlass::half_t>::value) {
+      if (params.quant_method == wintx::WintQuantMethod::kWeightOnlyInt25) {
+        KernelRunner<wintx::WintQuantMethod::kWeightOnlyInt25, kCompileNeeded>::run_kernel(params, shared_storage);
+      } else {
+        KernelRunner<wintx::WintQuantMethod::kNone, kCompileNeeded>::run_kernel(params, shared_storage);
+      }
+    } else if constexpr (std::is_same<ElementB, uint8_t>::value) {
+      KernelRunner<wintx::WintQuantMethod::kWeightOnlyInt8, kCompileNeeded>::run_kernel(params, shared_storage);
+    } else if constexpr (std::is_same<ElementB, cutlass::uint4b_t>::value) {
+      KernelRunner<wintx::WintQuantMethod::kWeightOnlyInt4, kCompileNeeded>::run_kernel(params, shared_storage);
+    } else {
+      CUTLASS_NOT_IMPLEMENTED();
+    }
   }
 };
 

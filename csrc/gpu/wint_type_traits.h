@@ -20,6 +20,7 @@
 #include <string>
 
 #include "cutlass/cutlass.h"
+#include "cutlass/layout/layout.h"
 #include "cutlass/numeric_types.h"
 
 namespace wintx {
@@ -31,19 +32,47 @@ enum WintQuantMethod {
   kWeightOnlyInt25 = 3
 };
 
+template <int32_t GroupSize, int32_t NumPackedValues>
+constexpr int32_t CalcPackedSize() {
+  return (GroupSize + NumPackedValues - 1) / NumPackedValues;
+}
+
 template <WintQuantMethod Method>
 struct WintTypeTraits {
+  using WeightType = cutlass::bfloat16_t;
+
+  CUTLASS_DEVICE
+  static int64_t CaclPackedDim(int64_t dim) { return dim; }
+};
+
+template <>
+struct WintTypeTraits<WintQuantMethod::kWeightOnlyInt8> {
   using WeightType = uint8_t;
+
+  CUTLASS_DEVICE
+  static int64_t CaclPackedDim(int64_t dim) { return dim; }
 };
 
 template <>
 struct WintTypeTraits<WintQuantMethod::kWeightOnlyInt4> {
   using WeightType = cutlass::uint4b_t;
+
+  CUTLASS_DEVICE
+  static int64_t CaclPackedDim(int64_t dim) { return dim; }
 };
 
 template <>
 struct WintTypeTraits<WintQuantMethod::kWeightOnlyInt25> {
   using WeightType = uint16_t;
+
+  static constexpr int32_t kGroupSize = 64;
+  static constexpr int32_t kNumPackedValues = 7;
+  static constexpr int32_t kPackedSize = CalcPackedSize<kGroupSize, kNumPackedValues>(); // 10
+
+  CUTLASS_DEVICE
+  static int64_t CaclPackedDim(int64_t dim) {
+    return dim * kPackedSize / kGroupSize;
+  }
 };
 
 // Convert CUDA data type to cutlass data type
@@ -57,18 +86,24 @@ struct CutlassDataType<half> {
   using Type = cutlass::half_t;
 };
 
-template <> struct CutlassDataType<__nv_bfloat16> {
+template <>
+struct CutlassDataType<__nv_bfloat16> {
   using Type = cutlass::bfloat16_t;
 };
 
 template <typename ElementT, typename WeightT>
 struct CutlassMmaTraits {
-  using MmaWeightType = typename CutlassDataType<WeightT>::Type;
+  using MmaWeightType = typename CutlassDataType<ElementT>::Type;
 };
 
 template <typename ElementT>
-struct CutlassMmaTraits<ElementT, uint16_t> {
-  using MmaWeightType = typename CutlassDataType<ElementT>::Type;
+struct CutlassMmaTraits<ElementT, uint8_t> {
+  using MmaWeightType = uint8_t;
+};
+
+template <typename ElementT>
+struct CutlassMmaTraits<ElementT, cutlass::uint4b_t> {
+  using MmaWeightType = cutlass::uint4b_t;
 };
 
 template <typename T>
@@ -85,6 +120,16 @@ std::string GetCutlassDataTypeString() {
     return "uint8_t";
   } else if (std::is_same<T, cutlass::uint4b_t>::value) {
     return "cutlass::uint4b_t";
+  }
+  return "unknown";
+}
+
+template <typename Layout>
+std::string GetCutlassLayoutString() {
+  if (std::is_same<Layout, cutlass::layout::RowMajor>::value) {
+    return "cutlass::layout::RowMajor";
+  } else if (std::is_same<Layout, cutlass::layout::ColumnMajor>::value) {
+    return "cutlass::layout::ColumnMajor";
   }
   return "unknown";
 }
