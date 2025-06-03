@@ -135,6 +135,7 @@ void MoeFFNKernel(const paddle::Tensor& permute_input,
         "none",
         stream);
   }
+  cudaDeviceSynchronize();
 
 #if 0
   auto act_out_tensor = paddle::experimental::swiglu(fc1_out_tensor, nullptr);

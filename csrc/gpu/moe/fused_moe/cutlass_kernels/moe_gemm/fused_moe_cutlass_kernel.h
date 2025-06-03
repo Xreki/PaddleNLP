@@ -86,6 +86,8 @@ constexpr bool NeedCompile() {
 // SFINAE overload for dequantizing gemm
 template <
     typename Mma,
+    typename TileDequanterB,
+    wintx::WintQuantMethod QuantMethod,
     typename ElementScale,
     typename platform::enable_if<use_dq_gemm<Mma>::value, bool>::type = true>
 CUTLASS_DEVICE static void run_mma(Mma mma,
@@ -93,6 +95,7 @@ CUTLASS_DEVICE static void run_mma(Mma mma,
                                    typename Mma::FragmentC& accum,  // NOLINT
                                    typename Mma::IteratorA iterator_A,
                                    typename Mma::IteratorB iterator_B,
+                                   TileDequanterB tile_dequanter_B,
                                    typename Mma::FragmentC const& src_accum,
                                    ElementScale* weight_scale_ptr,
                                    MatrixCoord scale_extent,
@@ -117,6 +120,8 @@ CUTLASS_DEVICE static void run_mma(Mma mma,
 // SFINAE overload for normal gemm. This completely ignores the scale parameters
 template <
     typename Mma,
+    typename TileDequanterB,
+    wintx::WintQuantMethod QuantMethod,
     typename ElementScale,
     typename platform::enable_if<!use_dq_gemm<Mma>::value, bool>::type = true>
 CUTLASS_DEVICE static void run_mma(Mma mma,
@@ -124,13 +129,18 @@ CUTLASS_DEVICE static void run_mma(Mma mma,
                                    typename Mma::FragmentC& accum,  // NOLINT
                                    typename Mma::IteratorA iterator_A,
                                    typename Mma::IteratorB iterator_B,
+                                   TileDequanterB tile_dequanter_B,
                                    typename Mma::FragmentC const& src_accum,
                                    ElementScale* weight_scale_ptr,
                                    MatrixCoord scale_extent,
                                    const int thread_idx,
                                    MatrixCoord tb_offset_scale) {
-  CUTLASS_TRACE_DEVICE(" use_dq_gemm is false");                                    
-  mma(gemm_k_iterations, accum, iterator_A, iterator_B, src_accum);
+  CUTLASS_TRACE_DEVICE(" use_dq_gemm is false");
+  //if constexpr (QuantMethod == wintx::WintQuantMethod::kWeightOnlyInt25) {
+    mma(gemm_k_iterations, accum, iterator_A, iterator_B, tile_dequanter_B, src_accum);
+  //} else {
+  //  mma(gemm_k_iterations, accum, iterator_A, iterator_B, src_accum);
+  //}
 }
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
@@ -457,13 +467,15 @@ struct MoeFCGemm {
                   kInterleave >= 1,
           "B must be row major/col major OR col major interleaved.");
 
+      CUTLASS_TRACE_DEVICE("Launch Information:");
+      CUTLASS_TRACE_DEVICE(" gridDim: {%d, %d, %d}, blockDim: {%d, %d, %d}", gridDim.x, gridDim.y, gridDim.z, blockDim.x, blockDim.y, blockDim.z);
       CUTLASS_TRACE_DEVICE("SharedStorage Information:");
       CUTLASS_TRACE_DEVICE(" ProblemVisitor::SharedStorage: %d bytes", static_cast<int>(sizeof(ProblemVisitor::SharedStorage)));
       CUTLASS_TRACE_DEVICE(" Mma::SharedStorage: %d bytes", static_cast<int>(sizeof(Mma::SharedStorage)));
       CUTLASS_TRACE_DEVICE(" Epilogue::SharedStorage: %d bytes", static_cast<int>(sizeof(Epilogue::SharedStorage)));
-      
+
       // LayoutB should be RowMajor
-      using TileDequanterB = TileDequanter<ElementB, ThreadblockShape::kK, ThreadblockShape::kN, QuantMethod>;
+      using TileDequanterB = TileDequanter<ElementB, ElementScale, ThreadblockShape::kK, ThreadblockShape::kN, QuantMethod>;
       __shared__ typename TileDequanterB::SharedStorage dequant_storage_B;
       CUTLASS_TRACE_DEVICE(" TileDequanter::SharedStorage: %d bytes", static_cast<int>(sizeof(dequant_storage_B)));
 
@@ -496,6 +508,12 @@ struct MoeFCGemm {
             int(cta_idx / grid_shape.n()) * Mma::Shape::kM,  // NOLINT
             int(cta_idx % grid_shape.n()) * Mma::Shape::kN,  // NOLINT
             0);
+
+        // begin address offset for weight_scale.
+        ElementScale* weight_scale_ptr =
+            params.weight_scales + problem_idx * problem_size.n();
+        // the begin threadblock_offset of scale, which holds the same column id with C, but with no row id
+        cutlass::MatrixCoord tb_offset_scale{0, threadblock_offset.n()};
 
         // Load element pointers. Exchange pointers and strides if working on
         // the transpose
@@ -532,10 +550,8 @@ struct MoeFCGemm {
         cutlass::MatrixCoord extent_B{problem_size.k() * kInterleave, problem_size.n() / kInterleave};
         cutlass::MatrixCoord extent_B_shared{TileDequanterB::kRows, TileDequanterB::kColumns};
 
-        ElementB* ptr_B = TileDequanterB::Run(byte_ptr_B, dequant_storage_B, nullptr, ldm_B, tb_offset_B);
-
-        // the begin threadblock_offset of scale, which holds the same column id with C, but with no row id
-        cutlass::MatrixCoord tb_offset_scale{0, threadblock_offset.n()};
+        TileDequanterB tile_dequanter_B(dequant_storage_B, byte_ptr_B, ldm_B, tb_offset_B, weight_scale_ptr, tb_offset_scale);
+        ElementB* ptr_B = tile_dequanter_B.GetOutPtr();
 
         // Compute position within threadblock
         int thread_idx = threadIdx.x;
@@ -550,11 +566,11 @@ struct MoeFCGemm {
 
         CUTLASS_TRACE_DEVICE(" iterator_B, ptr_B=%p, ldm_B=%ld", ptr_B, ldm_B);
         typename Mma::IteratorB iterator_B(
-            LayoutB(TileDequanterB::kPreDequantToSharedMemory ? ldm_B_shared : ldm_B),
+            LayoutB(TileDequanterB::kUseSharedMemory ? ldm_B_shared : ldm_B),
             ptr_B,
-            TileDequanterB::kPreDequantToSharedMemory ? extent_B_shared : extent_B,
+            TileDequanterB::kUseSharedMemory ? extent_B_shared : extent_B,
             thread_idx,
-            TileDequanterB::kPreDequantToSharedMemory ? cutlass::make_Coord(0, 0) : tb_offset_B);
+            TileDequanterB::kUseSharedMemory ? cutlass::make_Coord(0, 0) : tb_offset_B);
 
         typename Mma::FragmentC accumulators;
 
@@ -591,13 +607,12 @@ struct MoeFCGemm {
         __syncthreads();
 
         // Compute threadblock-scoped matrix multiply-add
-        ElementScale* weight_scale_ptr =
-            params.weight_scales + problem_idx * problem_size.n();
-        run_mma<Mma>(mma,
+        run_mma<Mma, TileDequanterB, QuantMethod>(mma,
                      gemm_k_iterations,
                      accumulators,
                      iterator_A,
                      iterator_B,
+                     tile_dequanter_B,
                      accumulators,
                      weight_scale_ptr,
                      {1, problem_size.n()},

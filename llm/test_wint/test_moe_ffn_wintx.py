@@ -17,11 +17,63 @@ import os
 import numpy as np
 import paddle
 from paddlenlp_ops import moe_expert_ffn
+from wintx_reference import moe_group_gemm
 
 from paddlenlp.experimental.wintx.wintx_fused_moe_decode import (
     fused_moe_wintx_decode_wint2_5,
     fused_moe_wintx_decode_wint2_75,
 )
+
+
+def check_result(dtype, out_1, out_2, check_equal=False):
+    def get_flattened_array(out):
+        if isinstance(out, paddle.Tensor):
+            if out.dtype == paddle.bfloat16:
+                res = paddle.cast(out, dtype="float32").numpy()
+            else:
+                res = out.numpy()
+        return res.flatten()
+
+    out_1_flatten = get_flattened_array(out_1)
+    out_2_flatten = get_flattened_array(out_2)
+
+    diff = np.abs(out_1_flatten - out_2_flatten)
+    max_atol_idx = np.argmax(diff)
+    print(f"-- max difference     : {np.max(diff)}, {out_1_flatten[max_atol_idx]} vs {out_2_flatten[max_atol_idx]}")
+
+    relative_error = np.abs(diff / (out_2_flatten + 1e-8))
+    max_rtol_idx = np.nanargmax(relative_error)
+    print(
+        f"-- max relative error : {np.nanmax(relative_error)}, {out_1_flatten[max_rtol_idx]} vs {out_2_flatten[max_rtol_idx]}"
+    )
+
+    if check_equal:
+        num_diffs = 0
+        for i in range(out_1.size):
+            if num_diffs >= 10:
+                break
+
+            if out_1_flatten[i] != out_2_flatten[i]:
+                print(f"-- {i}: {out_1_flatten[i]} vs {out_2_flatten[i]}")
+                num_diffs += 1
+        np.testing.assert_array_equal(out_1, out_2)
+    else:
+        if dtype == "float32":
+            if os.getenv("NVIDIA_TF32_OVERRIDE", "1") == "0":
+                atol, rtol = 1e-5, 1e-5
+            else:
+                atol, rtol = 1e-3, 1e-3
+        elif dtype == "float16":
+            atol, rtol = 1e-3, 1e-3
+        elif dtype == "bfloat16":
+            atol, rtol = 1e-2, 1e-2
+
+        np.testing.assert_allclose(
+            out_1,
+            out_2,
+            atol=atol,
+            rtol=rtol,
+        )
 
 
 def print_tensor_info(t, name):
@@ -138,10 +190,13 @@ def test_main_wint2_5(test_dir):
             w2_scale=ffn2_weights_scale,
         )
     else:
+        permute_input = paddle.ones_like(tensor_dict["permute_input"], dtype="float32").astype(paddle.bfloat16)
+        tokens_per_experts = tensor_dict["tokens_per_experts"]
+
         quant_type = "weight_only_int2.5"
         ffn_out = moe_expert_ffn(
-            tensor_dict["permute_input"],
-            tensor_dict["tokens_per_experts"],
+            permute_input,
+            tokens_per_experts,
             tensor_dict["ffn1_weights"],
             tensor_dict["ffn2_weights"],
             None,
@@ -149,6 +204,33 @@ def test_main_wint2_5(test_dir):
             ffn2_weights_scale,
             quant_type,
         )
+
+        print_tensor_info(ffn_out, "ffn_out")
+        ffn_out = paddle.cast(ffn_out, dtype="float32")
+        print("ffn_out: ", ffn_out)
+        print("ffn_out[0, 0:128]: ", ffn_out[0, 0:128])
+        print("ffn_out[0, 128:256]: ", ffn_out[0, 128:256])
+        print("ffn_out[0, 256:384]: ", ffn_out[0, 256:384])
+        print("ffn_out[0, 384:512]: ", ffn_out[0, 384:512])
+
+        w1_shape = [ffn1_weights_scale.shape[0], permute_input.shape[1], ffn1_weights_scale.shape[1]]
+        fake_ffn1_weights = paddle.ones(shape=w1_shape, dtype="float32")
+        # num_column_tiles = w1_shape[2] // 128
+        # for i in range(num_column_tiles):
+        #    fake_ffn1_weights[:, :, i * 128 : (i + 1) * 128] = paddle.full(shape=[w1_shape[0], w1_shape[1], 128], fill_value=i, dtype="float32")
+        num_row_tiles = w1_shape[1] // 64
+        for i in range(num_row_tiles):
+            fake_ffn1_weights[:, i * 64 : (i + 1) * 64, :] = paddle.full(
+                shape=[w1_shape[0], 64, w1_shape[2]], fill_value=i, dtype="float32"
+            )
+        fake_ffn1_weights = paddle.cast(fake_ffn1_weights, permute_input.dtype)
+        fake_fc1_out = moe_group_gemm(permute_input, tokens_per_experts, fake_ffn1_weights)
+
+        print_tensor_info(fake_fc1_out, "fake_fc1_out")
+        fake_fc1_out = paddle.cast(fake_fc1_out, dtype="float32")
+        print("fake_fc1_out: ", fake_fc1_out)
+
+        check_result("bfloat16", ffn_out, fake_fc1_out, check_equal=False)
 
 
 def test_main():
