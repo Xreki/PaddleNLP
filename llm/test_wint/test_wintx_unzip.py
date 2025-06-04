@@ -37,6 +37,28 @@ def load_all_tensors(tensor_names, dump_dir):
     return tensor_dict
 
 
+def check_equal(target, reference):
+    ne_out = paddle.not_equal(target, reference).cast("int32")
+    num_ne = paddle.sum(ne_out)
+    if num_ne.item() != 0:
+        target_np = target.cast("float32").numpy()
+        reference_np = reference.cast("float32").numpy()
+
+        target_shape = target.shape
+        for i in range(target_shape[0]):
+            for j in range(target_shape[1]):
+                for k in range(target_shape[2]):
+                    if target_np[i, j, k] != reference_np[i, j, k]:
+                        print(
+                            f"-- [{i}, {j}, {k}] mismatch: {target_np[i, j, k]} vs {reference_np[i, j, k]}"
+                        )
+                        sys.exit(0)
+    else:
+        print("unziped_weight is equal to reference!")
+
+    # np.testing.assert_array_equal(target_np, reference_np)
+
+
 def test_main_wint2_5_unzip(test_dir):
     dump_dir = os.path.join(test_dir, "moe_triton_wint2.5")
     tensor_names = [
@@ -61,25 +83,7 @@ def test_main_wint2_5_unzip(test_dir):
     )
     # print("unziped_weight_reference[1, 0, 0:6]:", unziped_weight_reference[1, 0, 0:6].astype("float32"))
 
-    ne_out = paddle.not_equal(unzipped_weight, unziped_weight_reference).cast("int32")
-    num_ne = paddle.sum(ne_out)
-    if num_ne.item() != 0:
-        unzipped_weight_np = unzipped_weight.cast("float32").numpy()
-        unziped_weight_reference_np = unziped_weight_reference.cast("float32").numpy()
-
-        w_shape = unzipped_weight.shape
-        for i in range(w_shape[0]):
-            for j in range(w_shape[1]):
-                for k in range(w_shape[2]):
-                    if unzipped_weight_np[i, j, k] != unziped_weight_reference_np[i, j, k]:
-                        print(
-                            f"[{i}, {j}, {k}] mismatch: {unzipped_weight_np[i, j, k]} vs {unziped_weight_reference_np[i, j, k]}"
-                        )
-                        sys.exit(0)
-    else:
-        print("unziped_weight is equal to reference!")
-
-    # np.testing.assert_array_equal(unzipped_weight_np, unziped_weight_reference_np)
+    check_equal(unzipped_weight, unziped_weight_reference)
 
 
 def test_main(test_dir):

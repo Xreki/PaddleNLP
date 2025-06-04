@@ -27,9 +27,9 @@ void MoeFFNKernel(const paddle::Tensor& permute_input,
                   const paddle::optional<paddle::Tensor>& ffn2_scale,
                   const std::string& quant_method,
                   paddle::Tensor ffn_out) {
-  typedef PDTraits<T> traits_;
-  typedef typename traits_::DataType DataType_;
-  typedef typename traits_::data_t data_t;
+  using traits_ = PDTraits<T>;
+  using DataType_ = typename traits_::DataType;
+  using data_t = typename traits_::data_t;
 
   auto ffn_out_data = ffn_out.data<data_t>();
   auto permuted_data = permute_input.data<data_t>();

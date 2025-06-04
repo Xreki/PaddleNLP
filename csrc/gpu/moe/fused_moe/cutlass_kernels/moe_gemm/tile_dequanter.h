@@ -42,9 +42,11 @@ struct TileDequanter {
   TileDequanter(SharedStorage& storage,
                 char *pointer,
                 int64_t ldm,
-                cutlass::MatrixCoord tb_offset,
+                const cutlass::MatrixCoord &extent,
+                const cutlass::MatrixCoord &tb_offset,
                 ScaleElementT* super_scale_ptr,
-                cutlass::MatrixCoord tb_offset_scale) : pointer(pointer) {}
+                const cutlass::MatrixCoord &extent_scale,
+                const cutlass::MatrixCoord &tb_offset_scale) : pointer(pointer) {}
 
   CUTLASS_DEVICE
   MmaElementT* GetOutPtr() { return reinterpret_cast<MmaElementT*>(pointer); }
@@ -77,18 +79,29 @@ struct TileDequanter<MmaElementT, ScaleElementT, Rows, Columns, Method, std::ena
   char* pointer{nullptr};
   int64_t ldm{0};
   cutlass::MatrixCoord tb_offset;
+  cutlass::MatrixCoord extent;
 
   ScaleElementT* super_scale_ptr{nullptr};
   cutlass::MatrixCoord tb_offset_scale;
+  cutlass::MatrixCoord extent_scale;
 
   CUTLASS_DEVICE
   TileDequanter(SharedStorage& storage,
                 char *pointer,
                 int64_t ldm,
-                cutlass::MatrixCoord tb_offset,
+                const cutlass::MatrixCoord &extent,
+                const cutlass::MatrixCoord &tb_offset,
                 ScaleElementT* super_scale_ptr,
-                cutlass::MatrixCoord tb_offset_scale)
-    : smem_ptr(storage.smem), pointer(pointer), ldm(ldm), tb_offset(tb_offset), super_scale_ptr(super_scale_ptr), tb_offset_scale(tb_offset_scale) {}
+                const cutlass::MatrixCoord &extent_scale,
+                const cutlass::MatrixCoord &tb_offset_scale)
+    : smem_ptr(storage.smem),
+      pointer(pointer),
+      ldm(ldm),
+      extent(extent),
+      tb_offset(tb_offset),
+      super_scale_ptr(super_scale_ptr),
+      extent_scale(extent_scale),
+      tb_offset_scale(tb_offset_scale) {}
 
   CUTLASS_DEVICE
   MmaElementT* GetOutPtr() { return smem_ptr; }
@@ -98,33 +111,41 @@ struct TileDequanter<MmaElementT, ScaleElementT, Rows, Columns, Method, std::ena
     CUTLASS_TRACE_DEVICE(" [TileDequanter] tile_offset={%d, %d}", static_cast<int>(tile_offset.row()), static_cast<int>(tile_offset.column()));
     tb_offset.row() += tile_offset.row() * kRows;
     tb_offset.column() += tile_offset.column() * kColumns;
+    tb_offset_scale.column() += tile_offset.column() * kColumns;
   }
 
   CUTLASS_DEVICE
   void Apply() {
     int fake_value = static_cast<int>(tb_offset.row()) / kRows;
-    CUTLASS_TRACE_DEVICE(" [TileDequanter] SharedStorage: {%d, %d} * %d bytes; tb_offset={%d, %d}, fake_value={%d}",
-        kRows, kColumns, static_cast<int>(sizeof(MmaElementT)),
-        static_cast<int>(tb_offset.row()), static_cast<int>(tb_offset.column()), fake_value);
-  
-    int32_t thread_idx = threadIdx.x;
-    int32_t num_threads = blockDim.x;
+    if (tb_offset.row() >= extent.row() || tb_offset.column() >= extent.column()) {
+      CUTLASS_TRACE_DEVICE(" [TileDequanter] SharedStorage: {%d, %d} * %d bytes; tb_offset={%d, %d}, skipped!!!",
+          kRows, kColumns, static_cast<int>(sizeof(MmaElementT)),
+          static_cast<int>(tb_offset.row()), static_cast<int>(tb_offset.column()));
+      return;
+    } else {
+      CUTLASS_TRACE_DEVICE(" [TileDequanter] SharedStorage: {%d, %d} * %d bytes; tb_offset={%d, %d}, fake_value={%d}",
+          kRows, kColumns, static_cast<int>(sizeof(MmaElementT)),
+          static_cast<int>(tb_offset.row()), static_cast<int>(tb_offset.column()), fake_value);
+    }
 
     MmaElementT* out_ptr = smem_ptr;
 
-    ElementT* in_ptr = reinterpret_cast<ElementT*>(pointer) + tb_offset.row() * ldm + tb_offset.column();
+    int zipped_row = tb_offset.row() * 10 / 64;
+    ElementT* in_ptr = reinterpret_cast<ElementT*>(pointer) + zipped_row * ldm + tb_offset.column();
     ScaleElementT* scale_ptr = super_scale_ptr + tb_offset_scale.column();
 
-#if 0
+#if 1
     UnzipFunctor unzip_functor;
     unzip_functor(in_ptr, scale_ptr, out_ptr, ldm);
-#endif
-
+#else
+    int32_t thread_idx = threadIdx.x;
+    int32_t num_threads = blockDim.x;
     for (int col = thread_idx; col < kColumns; col += num_threads) {
       for (int row = 0; row < kRows; ++row) {
         out_ptr[row * kColumns + col] = static_cast<MmaElementT>(fake_value);
       }
     }
     __syncthreads();
+#endif
   }
 };

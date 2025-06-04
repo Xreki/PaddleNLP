@@ -550,7 +550,7 @@ struct MoeFCGemm {
         cutlass::MatrixCoord extent_B{problem_size.k() * kInterleave, problem_size.n() / kInterleave};
         cutlass::MatrixCoord extent_B_shared{TileDequanterB::kRows, TileDequanterB::kColumns};
 
-        TileDequanterB tile_dequanter_B(dequant_storage_B, byte_ptr_B, ldm_B, tb_offset_B, weight_scale_ptr, tb_offset_scale);
+        TileDequanterB tile_dequanter_B(dequant_storage_B, byte_ptr_B, ldm_B, extent_B, tb_offset_B, weight_scale_ptr, {1, problem_size.n()}, tb_offset_scale);
         ElementB* ptr_B = tile_dequanter_B.GetOutPtr();
 
         // Compute position within threadblock

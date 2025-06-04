@@ -85,14 +85,17 @@ def moe_group_gemm(permute_input, token_nums_per_expert, weight):
 
     # 2. 计算前缀和，仅用于token分配
     token_nums_per_expert_np = token_nums_per_expert.numpy()
-    token_nums_prefix_sum_np = np.zeros(len(token_nums_per_expert_np) + 1, dtype=np.int64)
-    token_nums_prefix_sum_np[1:] = np.cumsum(token_nums_per_expert_np)
+    #token_nums_prefix_sum_np = np.zeros(len(token_nums_per_expert_np) + 1, dtype=np.int64)
+    #token_nums_prefix_sum_np[1:] = np.cumsum(token_nums_per_expert_np)
 
     # 3. 为每个专家计算
     for expert_idx in range(len(token_nums_per_expert_np)):
         # 获取当前专家的token范围
-        start_idx = token_nums_prefix_sum_np[expert_idx]
-        end_idx = token_nums_prefix_sum_np[expert_idx + 1]
+        if expert_idx == 0:
+            start_idx = 0
+        else:
+            start_idx = token_nums_per_expert_np[expert_idx - 1]
+        end_idx = token_nums_per_expert_np[expert_idx]
 
         if start_idx == end_idx:  # 该专家没有分配token
             continue

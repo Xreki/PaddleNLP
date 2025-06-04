@@ -13,16 +13,37 @@
 # limitations under the License.
 
 import os
-
+import sys
 import numpy as np
 import paddle
 from paddlenlp_ops import moe_expert_ffn
-from wintx_reference import moe_group_gemm
+from wintx_reference import moe_group_gemm, unzip_and_dequant_wint2_5
 
-from paddlenlp.experimental.wintx.wintx_fused_moe_decode import (
-    fused_moe_wintx_decode_wint2_5,
-    fused_moe_wintx_decode_wint2_75,
-)
+try:
+    from paddlenlp.experimental.wintx.wintx_fused_moe_decode import (
+        fused_moe_wintx_decode_wint2_5,
+        fused_moe_wintx_decode_wint2_75,
+    )
+except ImportError:
+    pass
+
+
+def check_allclose(target, reference):
+    allclose_out = paddle.allclose(target, reference, rtol=1e-02, atol=1e-02).numpy()
+    if not allclose_out:
+        target_np = target.cast("float32").numpy()
+        reference_np = reference.cast("float32").numpy()
+
+        target_shape = target.shape
+        for i in range(target_shape[0]):
+            for j in range(target_shape[1]):
+                if target_np[i, j] != reference_np[i, j]:
+                    print(
+                        f"-- [{i}, {j}] mismatch: {target_np[i, j]} vs {reference_np[i, j]}"
+                    )
+                    sys.exit(0)
+    else:
+        print("check_allclose passed, with rtol=1e-02, atol=1e-02!")
 
 
 def check_result(dtype, out_1, out_2, check_equal=False):
@@ -93,6 +114,23 @@ def load_all_tensors(tensor_names, dump_dir):
     return tensor_dict
 
 
+def generate_fake_weight(w_shape, w_dtype, tile_shape):
+    fake_weight = paddle.ones(shape=w_shape, dtype="float32")
+    # num_column_tiles = w1_shape[2] // tile_shape[1]
+    # for i in range(num_column_tiles):
+    #    fake_ffn1_weights[:, :, i * 128 : (i + 1) * 128] = paddle.full(shape=[w1_shape[0], w1_shape[1], 128], fill_value=i, dtype="float32")
+    tile_rows = tile_shape[0]
+    num_row_tiles = w_shape[1] // tile_rows
+    fake_weights = paddle.zeros(shape=w_shape, dtype="float32")
+    for i in range(num_row_tiles):
+        fake_weights[:, i * tile_rows : (i + 1) * tile_rows, :] = paddle.full(
+            shape=[w_shape[0], 64, w_shape[2]], fill_value=i, dtype="float32"
+        )
+    if w_dtype != paddle.float32:
+        fake_weights = paddle.cast(fake_weights, w_dtype)
+    return fake_weights
+
+
 def test_main_wint4(i=1, test_dir=None):
     dump_dir = os.path.join(test_dir, "dump_moe_ffn_wint4")
     tensor_names = [
@@ -108,19 +146,39 @@ def test_main_wint4(i=1, test_dir=None):
     tensor_dict = load_all_tensors(tensor_names, dump_dir)
     print(f"token_nums_per_expert: {tensor_dict['token_nums_per_expert']}")
 
-    quant_type = "weight_only_int4"
+    quant_type = "none"
+    #quant_type = "weight_only_int4"
+
+    ffn1_weights = tensor_dict["ffn1_weights"]
+    ffn2_weights = tensor_dict["ffn2_weights"]
+    ffn1_weights_scale = tensor_dict["ffn1_weights_scale"]
+    ffn2_weights_scale = tensor_dict["ffn2_weights_scale"]
+
+    if quant_type == "none":
+        num_experts = ffn1_weights_scale.shape[0]
+        intermediate_size = ffn1_weights_scale.shape[1] // 2
+        hidden_size = ffn2_weights_scale.shape[1]
+        w1_shape = [num_experts, hidden_size, intermediate_size * 2]
+        w2_shape = [num_experts, intermediate_size, hidden_size]
+        ffn1_weights = paddle.randn(shape=w1_shape, dtype=paddle.bfloat16)
+        ffn2_weights = paddle.randn(shape=w2_shape, dtype=paddle.bfloat16)
+        print_tensor_info(ffn1_weights, "ffn1_weights")
+        print_tensor_info(ffn2_weights, "ffn2_weights")
+
     ffn_out = moe_expert_ffn(
         tensor_dict["permute_input"],
         tensor_dict["token_nums_per_expert"],
-        tensor_dict["ffn1_weights"],
-        tensor_dict["ffn2_weights"],
+        ffn1_weights,
+        ffn2_weights,
         tensor_dict["ffn1_biases"],
-        tensor_dict["ffn1_weights_scale"],
-        tensor_dict["ffn2_weights_scale"],
+        ffn1_weights_scale,
+        ffn2_weights_scale,
         quant_type,
     )
 
     print_tensor_info(ffn_out, "ffn_out")
+    print("ffn_out:", ffn_out)
+    #check_result("bfloat16", ffn_out, tensor_dict["ffn_out"], check_equal=False)
 
 
 def test_main_wint2_75(test_dir):
@@ -172,7 +230,6 @@ def test_main_wint2_5(test_dir):
         "fused_moe_out.pdparams",
     ]
     tensor_dict = load_all_tensors(tensor_names, dump_dir)
-    # print(f"tokens_per_experts: {tensor_dict['tokens_per_experts']}")
 
     ffn1_weights_scale = tensor_dict["ffn1_weights_scale"][:, 0, :]
     ffn2_weights_scale = tensor_dict["ffn2_weights_scale"][:, 0, :]
@@ -192,6 +249,7 @@ def test_main_wint2_5(test_dir):
     else:
         permute_input = paddle.ones_like(tensor_dict["permute_input"], dtype="float32").astype(paddle.bfloat16)
         tokens_per_experts = tensor_dict["tokens_per_experts"]
+        print(f"tokens_per_experts: {tokens_per_experts}")
 
         quant_type = "weight_only_int2.5"
         ffn_out = moe_expert_ffn(
@@ -208,36 +266,41 @@ def test_main_wint2_5(test_dir):
         print_tensor_info(ffn_out, "ffn_out")
         ffn_out = paddle.cast(ffn_out, dtype="float32")
         print("ffn_out: ", ffn_out)
-        print("ffn_out[0, 0:128]: ", ffn_out[0, 0:128])
-        print("ffn_out[0, 128:256]: ", ffn_out[0, 128:256])
-        print("ffn_out[0, 256:384]: ", ffn_out[0, 256:384])
-        print("ffn_out[0, 384:512]: ", ffn_out[0, 384:512])
 
-        w1_shape = [ffn1_weights_scale.shape[0], permute_input.shape[1], ffn1_weights_scale.shape[1]]
-        fake_ffn1_weights = paddle.ones(shape=w1_shape, dtype="float32")
-        # num_column_tiles = w1_shape[2] // 128
-        # for i in range(num_column_tiles):
-        #    fake_ffn1_weights[:, :, i * 128 : (i + 1) * 128] = paddle.full(shape=[w1_shape[0], w1_shape[1], 128], fill_value=i, dtype="float32")
-        num_row_tiles = w1_shape[1] // 64
-        for i in range(num_row_tiles):
-            fake_ffn1_weights[:, i * 64 : (i + 1) * 64, :] = paddle.full(
-                shape=[w1_shape[0], 64, w1_shape[2]], fill_value=i, dtype="float32"
+        use_fake_weight = False
+        if use_fake_weight:
+            w1_shape = [ffn1_weights_scale.shape[0], permute_input.shape[1], ffn1_weights_scale.shape[1]]
+            w1_dtype = ffn1_weights_scale.dtype
+            unzipped_ffn1_weights = generate_fake_weight(w1_shape, w1_dtype, tile_shape=[64, 128])
+        else:
+            unzipped_ffn1_weights = unzip_and_dequant_wint2_5(
+                zipped_weight=tensor_dict["ffn1_weights"], super_scale=ffn1_weights_scale, scale_compute_dtype=paddle.float32
             )
-        fake_ffn1_weights = paddle.cast(fake_ffn1_weights, permute_input.dtype)
-        fake_fc1_out = moe_group_gemm(permute_input, tokens_per_experts, fake_ffn1_weights)
+        #fc1_out = moe_group_gemm(permute_input, tokens_per_experts, unzipped_ffn1_weights)
+        # compare with bfloat16 with unziped weights
+        #ffn_out = moe_expert_ffn(
+        #    permute_input,
+        #    tokens_per_experts,
+        #    unzipped_ffn1_weights,
+        #    tensor_dict["ffn2_weights"],
+        #    None,
+        #    ffn1_weights_scale,
+        #    None,
+        #    "none",
+        #)
 
-        print_tensor_info(fake_fc1_out, "fake_fc1_out")
-        fake_fc1_out = paddle.cast(fake_fc1_out, dtype="float32")
-        print("fake_fc1_out: ", fake_fc1_out)
+        print_tensor_info(fc1_out, "fc1_out")
+        fc1_out = paddle.cast(fc1_out, dtype="float32")
+        print("fc1_out: ", fc1_out)
 
-        check_result("bfloat16", ffn_out, fake_fc1_out, check_equal=False)
+        #check_allclose(ffn_out, fc1_out)
+        check_result("bfloat16", ffn_out, fc1_out, check_equal=False)
 
 
-def test_main():
-    test_dir = "/work/models/PaddleNLP/llm/test_wint"
-    # quant_type = "weight_only_int4"
+def test_main(test_dir):
+    quant_type = "weight_only_int4"
     # quant_type = "weight_only_int2.75"
-    quant_type = "weight_only_int2.5"
+    #quant_type = "weight_only_int2.5"
     if quant_type == "weight_only_int4":
         test_main_wint4(test_dir=test_dir)
     elif quant_type == "weight_only_int2.75":
@@ -249,4 +312,5 @@ def test_main():
 
 
 if __name__ == "__main__":
-    test_main()
+    test_dir = os.path.dirname(os.path.abspath(__file__))
+    test_main(test_dir)

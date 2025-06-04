@@ -50,6 +50,8 @@ struct UnzipFunctor<T, wintx::WintQuantMethod::kWeightOnlyInt25, TileRows, TileC
     int num_threads = blockDim.x;
 
     for (int col = tid; col < TileColumns; col += num_threads) {
+      ScaleComputeT super_scale = static_cast<ScaleComputeT>(supper_scale_ptr[col]);
+
       for (int row = 0; row < TileRows; ++row) {
         int row_in_group = row % 64;
         int group_id = row / 64;
@@ -68,7 +70,6 @@ struct UnzipFunctor<T, wintx::WintQuantMethod::kWeightOnlyInt25, TileRows, TileC
         int32_t shifted_value = (static_cast<int32_t>(zipped_value) >> shift_bit) & WeightOnlyTraits::kWeightMask;
         int32_t value = static_cast<int32_t>(shifted_value) - WeightOnlyTraits::kBBZip;
 
-        ScaleComputeT super_scale = static_cast<ScaleComputeT>(supper_scale_ptr[col]);
         ScaleComputeT scaled_value = static_cast<ScaleComputeT>(value) * static_cast<ScaleComputeT>(local_scale) * super_scale;
 
         out_ptr[row * TileColumns + col] = static_cast<T>(scaled_value);
