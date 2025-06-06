@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import os
+import time
 import shutil
 import subprocess
 
@@ -20,6 +21,8 @@ import paddle
 from packaging.version import Version, parse
 from paddle.utils.cpp_extension import CUDAExtension, setup
 
+
+build_begin_time = time.time()
 sm_version = int(os.getenv("CUDA_SM_VERSION", "0"))
 
 
@@ -75,6 +78,9 @@ def strtobool(v):
 
 
 def get_gencode_flags():
+    cc = 90
+    return ["-gencode", "arch=compute_{0},code=sm_{0}".format(cc)]
+
     if not strtobool(os.getenv("FLAG_LLM_PDC", "False")):
         cc = get_sm_version()
         if cc == 90:
@@ -85,10 +91,10 @@ def get_gencode_flags():
         return [
             "-gencode",
             "arch=compute_80,code=sm_80",
-            # "-gencode",
-            # "arch=compute_75,code=sm_75",
-            # "-gencode",
-            # "arch=compute_70,code=sm_70",
+            "-gencode",
+            "arch=compute_75,code=sm_75",
+            "-gencode",
+            "arch=compute_70,code=sm_70",
         ]
 
 
@@ -142,7 +148,7 @@ update_git_submodule()
 nvcc_compile_args += [
     "-O3",
     "-DNDEBUG",
-    "-DCUTLASS_DEBUG_TRACE_LEVEL=1",
+    "-DCUTLASS_DEBUG_TRACE_LEVEL=0",
     "-U__CUDA_NO_HALF_OPERATORS__",
     "-U__CUDA_NO_HALF_CONVERSIONS__",
     "-U__CUDA_NO_BFLOAT16_OPERATORS__",
@@ -183,15 +189,15 @@ if os.path.isdir(fp8_auto_gen_directory):
     shutil.rmtree(fp8_auto_gen_directory)
 
 
-if cc == 89 and cuda_version >= 12.4:
-    os.system("python utils/auto_gen_fp8_fp8_gemm_fused_kernels.py --cuda_arch 89")
-    os.system("python utils/auto_gen_fp8_fp8_dual_gemm_fused_kernels.py --cuda_arch 89")
-    sources += find_end_files(fp8_auto_gen_directory, ".cu")
-    sources += [
-        "gpu/fp8_gemm_with_cutlass/fp8_fp8_half_gemm.cu",
-        "gpu/fp8_gemm_with_cutlass/fp8_fp8_half_cuda_core_gemm.cu",
-        "gpu/fp8_gemm_with_cutlass/fp8_fp8_fp8_dual_gemm.cu",
-    ]
+#if cc == 89 and cuda_version >= 12.4:
+#    os.system("python utils/auto_gen_fp8_fp8_gemm_fused_kernels.py --cuda_arch 89")
+#    os.system("python utils/auto_gen_fp8_fp8_dual_gemm_fused_kernels.py --cuda_arch 89")
+#    sources += find_end_files(fp8_auto_gen_directory, ".cu")
+#    sources += [
+#        "gpu/fp8_gemm_with_cutlass/fp8_fp8_half_gemm.cu",
+#        "gpu/fp8_gemm_with_cutlass/fp8_fp8_half_cuda_core_gemm.cu",
+#        "gpu/fp8_gemm_with_cutlass/fp8_fp8_fp8_dual_gemm.cu",
+#    ]
 
 # if cc >= 80 and nvcc_version >= Version("12.4"):
 #    os.environ.pop('PADDLE_CUDA_ARCH_LIST', None)
@@ -215,20 +221,20 @@ if cc == 89 and cuda_version >= 12.4:
 #        ]
 #        nvcc_compile_args += ["-gencode", "arch=compute_90a,code=compute_90a"]
 
-if cc >= 90 and cuda_version >= 12.0:
-    os.system("python utils/auto_gen_fp8_fp8_gemm_fused_kernels_sm90.py --cuda_arch 90")
-    os.system("python utils/auto_gen_fp8_fp8_gemm_fused_kernels_ptr_scale_sm90.py --cuda_arch 90")
-    os.system("python utils/auto_gen_fp8_fp8_dual_gemm_fused_kernels_sm90.py --cuda_arch 90")
-    os.system("python utils/auto_gen_fp8_fp8_block_gemm_fused_kernels_sm90.py --cuda_arch 90")
-    sources += find_end_files(fp8_auto_gen_directory, ".cu")
-    sources += [
-        "gpu/fp8_gemm_with_cutlass/fp8_fp8_half_gemm.cu",
-        "gpu/fp8_gemm_with_cutlass/fp8_fp8_half_cuda_core_gemm.cu",
-        "gpu/fp8_gemm_with_cutlass/fp8_fp8_fp8_dual_gemm.cu",
-        "gpu/fp8_gemm_with_cutlass/fp8_fp8_half_block_gemm.cu",
-        "gpu/fp8_gemm_with_cutlass/fp8_fp8_half_gemm_ptr_scale.cu",
-    ]
-    sources += find_end_files("./gpu/mla_attn", ".cu")
+#if cc >= 90 and cuda_version >= 12.0:
+#    os.system("python utils/auto_gen_fp8_fp8_gemm_fused_kernels_sm90.py --cuda_arch 90")
+#    os.system("python utils/auto_gen_fp8_fp8_gemm_fused_kernels_ptr_scale_sm90.py --cuda_arch 90")
+#    os.system("python utils/auto_gen_fp8_fp8_dual_gemm_fused_kernels_sm90.py --cuda_arch 90")
+#    os.system("python utils/auto_gen_fp8_fp8_block_gemm_fused_kernels_sm90.py --cuda_arch 90")
+#    sources += find_end_files(fp8_auto_gen_directory, ".cu")
+#    sources += [
+#        "gpu/fp8_gemm_with_cutlass/fp8_fp8_half_gemm.cu",
+#        "gpu/fp8_gemm_with_cutlass/fp8_fp8_half_cuda_core_gemm.cu",
+#        "gpu/fp8_gemm_with_cutlass/fp8_fp8_fp8_dual_gemm.cu",
+#        "gpu/fp8_gemm_with_cutlass/fp8_fp8_half_block_gemm.cu",
+#        "gpu/fp8_gemm_with_cutlass/fp8_fp8_half_gemm_ptr_scale.cu",
+#    ]
+#    sources += find_end_files("./gpu/mla_attn", ".cu")
 
 ops_name = f"paddlenlp_ops_{sm_version}" if sm_version != 0 else "paddlenlp_ops"
 
@@ -245,3 +251,4 @@ setup(
         include_dirs=include_dirs,
     ),
 )
+print(f"-- Build cost: {time.time() - build_begin_time} ms")

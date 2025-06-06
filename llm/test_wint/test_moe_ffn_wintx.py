@@ -22,11 +22,12 @@ import paddle
 
 if test_paddlenlp:
     print("import moe_expert_ffn from paddlenlp_ops")
-    from paddlenlp_ops import moe_expert_ffn
+    from paddlenlp_ops import moe_expert_ffn, winx_unzip
 else:
     print("import moe_expert_ffn from fastdeploy")
-    from fastdeploy.model_executor.ops.gpu import moe_expert_ffn
+    from fastdeploy.model_executor.ops.gpu import moe_expert_ffn, winx_unzip
 from wintx_reference import moe_group_gemm, unzip_and_dequant_wint2_5
+from test_utils import print_tensor_info, load_all_tensors, check_result
 
 try:
     from paddlenlp.experimental.wintx.wintx_fused_moe_decode import (
@@ -37,90 +38,14 @@ except ImportError:
     pass
 
 
-def check_allclose(target, reference):
-    allclose_out = paddle.allclose(target, reference, rtol=1e-02, atol=1e-02).numpy()
-    if not allclose_out:
-        target_np = target.cast("float32").numpy()
-        reference_np = reference.cast("float32").numpy()
-
-        target_shape = target.shape
-        for i in range(target_shape[0]):
-            for j in range(target_shape[1]):
-                if target_np[i, j] != reference_np[i, j]:
-                    print(
-                        f"-- [{i}, {j}] mismatch: {target_np[i, j]} vs {reference_np[i, j]}"
-                    )
-                    sys.exit(0)
-    else:
-        print("check_allclose passed, with rtol=1e-02, atol=1e-02!")
-
-
-def check_result(dtype, out_1, out_2, check_equal=False):
-    def get_flattened_array(out):
-        if isinstance(out, paddle.Tensor):
-            if out.dtype == paddle.bfloat16:
-                res = paddle.cast(out, dtype="float32").numpy()
-            else:
-                res = out.numpy()
-        return res.flatten()
-
-    out_1_flatten = get_flattened_array(out_1)
-    out_2_flatten = get_flattened_array(out_2)
-
-    diff = np.abs(out_1_flatten - out_2_flatten)
-    max_atol_idx = np.argmax(diff)
-    print(f"-- max difference     : {np.max(diff)}, {out_1_flatten[max_atol_idx]} vs {out_2_flatten[max_atol_idx]}")
-
-    relative_error = np.abs(diff / (out_2_flatten + 1e-8))
-    max_rtol_idx = np.nanargmax(relative_error)
-    print(
-        f"-- max relative error : {np.nanmax(relative_error)}, {out_1_flatten[max_rtol_idx]} vs {out_2_flatten[max_rtol_idx]}"
-    )
-
-    if check_equal:
-        num_diffs = 0
-        for i in range(out_1.size):
-            if num_diffs >= 10:
-                break
-
-            if out_1_flatten[i] != out_2_flatten[i]:
-                print(f"-- {i}: {out_1_flatten[i]} vs {out_2_flatten[i]}")
-                num_diffs += 1
-        np.testing.assert_array_equal(out_1, out_2)
-    else:
-        if dtype == "float32":
-            if os.getenv("NVIDIA_TF32_OVERRIDE", "1") == "0":
-                atol, rtol = 1e-5, 1e-5
-            else:
-                atol, rtol = 1e-3, 1e-3
-        elif dtype == "float16":
-            atol, rtol = 1e-3, 1e-3
-        elif dtype == "bfloat16":
-            atol, rtol = 1e-2, 1e-2
-
-        np.testing.assert_allclose(
-            out_1,
-            out_2,
-            atol=atol,
-            rtol=rtol,
-        )
-
-
-def print_tensor_info(t, name):
-    if t is not None:
-        print(f"-- [print_tensor_info] {name}: shape={t.shape}, dtype={t.dtype}")
-    else:
-        print(f"-- [print_tensor_info] {name}: tensor is {t}")
-
-
-def load_all_tensors(tensor_names, dump_dir):
-    tensor_dict = {}
-    for name in tensor_names:
-        key = name.replace(".pdparams", "").replace("_layer1", "")
-        filepath = os.path.join(dump_dir, name)
-        tensor_dict[key] = paddle.load(filepath)
-        print_tensor_info(tensor_dict[key], name)
-    return tensor_dict
+class MoEArguments:
+    def __init__(self, permute_input, tokens_expert_prefix_sum, ffn1_weights, ffn2_weights, ffn1_weights_scale, ffn2_weights_scale):
+        self.permute_input = permute_input
+        self.tokens_expert_prefix_sum = tokens_expert_prefix_sum
+        self.ffn1_weights = ffn1_weights
+        self.ffn2_weights = ffn2_weights
+        self.ffn1_weights_scale = ffn1_weights_scale
+        self.ffn2_weights_scale = ffn2_weights_scale
 
 
 def generate_fake_weight(w_shape, w_dtype, tile_shape):
@@ -155,7 +80,7 @@ def test_main_wint4(i=1, test_dir=None):
     tensor_dict = load_all_tensors(tensor_names, dump_dir)
     print(f"token_nums_per_expert: {tensor_dict['token_nums_per_expert']}")
 
-    quant_type = "none"
+    #quant_type = "none"
     #quant_type = "weight_only_int4"
 
     ffn1_weights = tensor_dict["ffn1_weights"]
@@ -219,6 +144,60 @@ def test_main_wint2_75(test_dir):
     )
 
 
+def run_moe_wint2_5_triton(tensor_dict):
+    topk = 8
+    moe_out = fused_moe_wintx_decode_wint2_5(
+        hidden_states=tensor_dict["gate_input"],
+        w1=tensor_dict["ffn1_weights"],
+        w2=tensor_dict["ffn2_weights"],
+        scores=tensor_dict["scores"],
+        topk=topk,
+        w1_scale=ffn1_weights_scale,
+        w2_scale=ffn2_weights_scale,
+    )
+    return moe_out
+
+
+def run_moe_ffn_wint2_5(moe_args):
+    quant_type = "weight_only_int2.5"
+    ffn_out = moe_expert_ffn(
+        moe_args.permute_input,
+        moe_args.tokens_expert_prefix_sum,
+        moe_args.ffn1_weights,
+        moe_args.ffn2_weights,
+        None,
+        moe_args.ffn1_weights_scale,
+        moe_args.ffn2_weights_scale,
+        quant_type,
+    )
+    return ffn_out
+
+
+def run_moe_ffn_bf16_with_wint2_5_weights(moe_args):
+    quant_type = "weight_only_int2.5"
+    unzipped_ffn1_weights = winx_unzip(
+        zipped_weight=moe_args.ffn1_weights,
+        super_scale=moe_args.ffn1_weights_scale,
+        quant_method=quant_type,
+    )
+    unzipped_ffn2_weights = winx_unzip(
+        zipped_weight=moe_args.ffn2_weights,
+        super_scale=moe_args.ffn2_weights_scale,
+        quant_method=quant_type,
+    )
+    ffn_out = moe_expert_ffn(
+        moe_args.permute_input,
+        moe_args.tokens_expert_prefix_sum,
+        unzipped_ffn1_weights,
+        unzipped_ffn2_weights,
+        None,
+        None,
+        None,
+        "none",
+    )
+    return ffn_out
+
+
 def test_main_wint2_5(test_dir):
     dump_dir = os.path.join(test_dir, "moe_triton_wint2.5")
     tensor_names = [
@@ -239,75 +218,29 @@ def test_main_wint2_5(test_dir):
         "fused_moe_out.pdparams",
     ]
     tensor_dict = load_all_tensors(tensor_names, dump_dir)
+    
+    moe_args = MoEArguments(
+        permute_input=tensor_dict["permute_input"],
+        tokens_expert_prefix_sum=tensor_dict["tokens_per_experts"],
+        ffn1_weights=tensor_dict["ffn1_weights"],
+        ffn2_weights=tensor_dict["ffn2_weights"],
+        ffn1_weights_scale=tensor_dict["ffn1_weights_scale"][:, 0, :],
+        ffn2_weights_scale=tensor_dict["ffn2_weights_scale"][:, 0, :],
+    )
 
-    ffn1_weights_scale = tensor_dict["ffn1_weights_scale"][:, 0, :]
-    ffn2_weights_scale = tensor_dict["ffn2_weights_scale"][:, 0, :]
+    ffn_out_wint = run_moe_ffn_wint2_5(moe_args)
+    ffn_out_bf16 = run_moe_ffn_bf16_with_wint2_5_weights(moe_args)
 
-    test_triton = False
-    if test_triton:
-        topk = 8
-        fused_moe_wintx_decode_wint2_5(
-            hidden_states=tensor_dict["gate_input"],
-            w1=tensor_dict["ffn1_weights"],
-            w2=tensor_dict["ffn2_weights"],
-            scores=tensor_dict["scores"],
-            topk=topk,
-            w1_scale=ffn1_weights_scale,
-            w2_scale=ffn2_weights_scale,
-        )
-    else:
-        permute_input = tensor_dict["permute_input"]
-        #permute_input = paddle.ones_like(tensor_dict["permute_input"], dtype="float32").astype(paddle.bfloat16)
-        tokens_per_experts = tensor_dict["tokens_per_experts"]
-        print(f"tokens_per_experts: {tokens_per_experts}")
+    print_tensor_info(ffn_out_wint, "ffn_out_wint")
+    ffn_out_wint = paddle.cast(ffn_out_wint, dtype="float32")
+    print("ffn_out_wint: ", ffn_out_wint)
 
-        quant_type = "weight_only_int2.5"
-        ffn_out = moe_expert_ffn(
-            permute_input,
-            tokens_per_experts,
-            tensor_dict["ffn1_weights"],
-            tensor_dict["ffn2_weights"],
-            None,
-            ffn1_weights_scale,
-            ffn2_weights_scale,
-            quant_type,
-        )
+    print_tensor_info(ffn_out_bf16, "ffn_out_bf16")
+    ffn_out_bf16 = paddle.cast(ffn_out_bf16, dtype="float32")
+    print("ffn_out_bf16: ", ffn_out_bf16)
 
-        print_tensor_info(ffn_out, "ffn_out")
-        ffn_out = paddle.cast(ffn_out, dtype="float32")
-        print("ffn_out: ", ffn_out)
-
-        use_fake_weight = False
-        if use_fake_weight:
-            w1_shape = [ffn1_weights_scale.shape[0], permute_input.shape[1], ffn1_weights_scale.shape[1]]
-            w1_dtype = ffn1_weights_scale.dtype
-            unzipped_ffn1_weights = generate_fake_weight(w1_shape, w1_dtype, tile_shape=[64, 128])
-        else:
-            unzipped_ffn1_weights = unzip_and_dequant_wint2_5(
-                zipped_weight=tensor_dict["ffn1_weights"], super_scale=ffn1_weights_scale, scale_compute_dtype=paddle.float32
-            )
-        compare_with_reference = False
-        if compare_with_reference:
-            fc1_out = moe_group_gemm(permute_input, tokens_per_experts, unzipped_ffn1_weights)
-        else:
-            # compare with bfloat16 with unziped weights
-            fc1_out = moe_expert_ffn(
-                permute_input,
-                tokens_per_experts,
-                unzipped_ffn1_weights,
-                tensor_dict["ffn2_weights"],
-                None,
-                ffn1_weights_scale,
-                None,
-                "none",
-            )
-
-        print_tensor_info(fc1_out, "fc1_out")
-        fc1_out = paddle.cast(fc1_out, dtype="float32")
-        print("fc1_out: ", fc1_out)
-
-        #check_allclose(ffn_out, fc1_out)
-        check_result("bfloat16", ffn_out, fc1_out, check_equal=False)
+    #check_allclose(ffn_out, fc1_out)
+    check_result("bfloat16", ffn_out_wint, ffn_out_bf16, check_equal=False)
 
 
 def test_main(test_dir):
