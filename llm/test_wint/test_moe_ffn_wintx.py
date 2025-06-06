@@ -13,10 +13,19 @@
 # limitations under the License.
 
 import os
+
+test_paddlenlp = int(os.getenv("TEST_PADDLENLP", 1))
+
 import sys
 import numpy as np
 import paddle
-from paddlenlp_ops import moe_expert_ffn
+
+if test_paddlenlp:
+    print("import moe_expert_ffn from paddlenlp_ops")
+    from paddlenlp_ops import moe_expert_ffn
+else:
+    print("import moe_expert_ffn from fastdeploy")
+    from fastdeploy.model_executor.ops.gpu import moe_expert_ffn
 from wintx_reference import moe_group_gemm, unzip_and_dequant_wint2_5
 
 try:
@@ -247,7 +256,8 @@ def test_main_wint2_5(test_dir):
             w2_scale=ffn2_weights_scale,
         )
     else:
-        permute_input = paddle.ones_like(tensor_dict["permute_input"], dtype="float32").astype(paddle.bfloat16)
+        permute_input = tensor_dict["permute_input"]
+        #permute_input = paddle.ones_like(tensor_dict["permute_input"], dtype="float32").astype(paddle.bfloat16)
         tokens_per_experts = tensor_dict["tokens_per_experts"]
         print(f"tokens_per_experts: {tokens_per_experts}")
 
@@ -276,18 +286,21 @@ def test_main_wint2_5(test_dir):
             unzipped_ffn1_weights = unzip_and_dequant_wint2_5(
                 zipped_weight=tensor_dict["ffn1_weights"], super_scale=ffn1_weights_scale, scale_compute_dtype=paddle.float32
             )
-        #fc1_out = moe_group_gemm(permute_input, tokens_per_experts, unzipped_ffn1_weights)
-        # compare with bfloat16 with unziped weights
-        #ffn_out = moe_expert_ffn(
-        #    permute_input,
-        #    tokens_per_experts,
-        #    unzipped_ffn1_weights,
-        #    tensor_dict["ffn2_weights"],
-        #    None,
-        #    ffn1_weights_scale,
-        #    None,
-        #    "none",
-        #)
+        compare_with_reference = False
+        if compare_with_reference:
+            fc1_out = moe_group_gemm(permute_input, tokens_per_experts, unzipped_ffn1_weights)
+        else:
+            # compare with bfloat16 with unziped weights
+            fc1_out = moe_expert_ffn(
+                permute_input,
+                tokens_per_experts,
+                unzipped_ffn1_weights,
+                tensor_dict["ffn2_weights"],
+                None,
+                ffn1_weights_scale,
+                None,
+                "none",
+            )
 
         print_tensor_info(fc1_out, "fc1_out")
         fc1_out = paddle.cast(fc1_out, dtype="float32")
@@ -298,9 +311,9 @@ def test_main_wint2_5(test_dir):
 
 
 def test_main(test_dir):
-    quant_type = "weight_only_int4"
+    # quant_type = "weight_only_int4"
     # quant_type = "weight_only_int2.75"
-    #quant_type = "weight_only_int2.5"
+    quant_type = "weight_only_int2.5"
     if quant_type == "weight_only_int4":
         test_main_wint4(test_dir=test_dir)
     elif quant_type == "weight_only_int2.75":

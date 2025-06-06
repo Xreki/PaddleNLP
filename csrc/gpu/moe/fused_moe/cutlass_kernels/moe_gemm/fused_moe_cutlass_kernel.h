@@ -101,7 +101,7 @@ CUTLASS_DEVICE static void run_mma(Mma mma,
                                    MatrixCoord scale_extent,
                                    const int thread_idx,
                                    MatrixCoord tb_offset_scale) {
-  CUTLASS_TRACE_DEVICE(" iterator_Scale, weight_scale_ptr=%p", weight_scale_ptr);                                  
+  //CUTLASS_TRACE_DEVICE(" iterator_Scale, weight_scale_ptr=%p", weight_scale_ptr);                                  
   typename Mma::IteratorScale iterator_scale(
       Mma::IteratorScale::Layout(scale_extent.column()),
       weight_scale_ptr,
@@ -135,7 +135,7 @@ CUTLASS_DEVICE static void run_mma(Mma mma,
                                    MatrixCoord scale_extent,
                                    const int thread_idx,
                                    MatrixCoord tb_offset_scale) {
-  CUTLASS_TRACE_DEVICE(" use_dq_gemm is false");
+  //CUTLASS_TRACE_DEVICE(" use_dq_gemm is false");
   //if constexpr (QuantMethod == wintx::WintQuantMethod::kWeightOnlyInt25) {
     mma(gemm_k_iterations, accum, iterator_A, iterator_B, tile_dequanter_B, src_accum);
   //} else {
@@ -308,6 +308,10 @@ struct MoeFCGemm {
       CUTLASS_TRACE_HOST("[Arguments] LayoutA: " << wintx::GetCutlassLayoutString<LayoutA>());
       CUTLASS_TRACE_HOST("[Arguments] LayoutB: " << wintx::GetCutlassLayoutString<LayoutB>());
       CUTLASS_TRACE_HOST("[Arguments] LayoutC: " << wintx::GetCutlassLayoutString<LayoutC>());
+      CUTLASS_TRACE_HOST("[Arguments] SharedStorage Information:");
+      CUTLASS_TRACE_HOST(" - ProblemVisitor::SharedStorage: " << sizeof(typename ProblemVisitor::SharedStorage) << " bytes");
+      CUTLASS_TRACE_HOST(" - Mma::SharedStorage: " << sizeof(typename Mma::SharedStorage) << " bytes");
+      CUTLASS_TRACE_HOST(" - Epilogue::SharedStorage: " << sizeof(typename Epilogue::SharedStorage) << " bytes");
     }
   };
 
@@ -448,7 +452,7 @@ struct MoeFCGemm {
       // These types shadow the type-level definitions and support the ability
       // to implement a 'transposed' GEMM that computes the transposed problems.
       //
-      CUTLASS_TRACE_DEVICE(" MoeFCGemm::KernelRunner::run_kernel()");
+      //CUTLASS_TRACE_DEVICE(" MoeFCGemm::KernelRunner::run_kernel()");
 
       using ElementA = typename Mma::IteratorA::Element;
       using LayoutA = typename Mma::IteratorA::Layout;
@@ -467,17 +471,9 @@ struct MoeFCGemm {
                   kInterleave >= 1,
           "B must be row major/col major OR col major interleaved.");
 
-      CUTLASS_TRACE_DEVICE("Launch Information:");
-      CUTLASS_TRACE_DEVICE(" gridDim: {%d, %d, %d}, blockDim: {%d, %d, %d}", gridDim.x, gridDim.y, gridDim.z, blockDim.x, blockDim.y, blockDim.z);
-      CUTLASS_TRACE_DEVICE("SharedStorage Information:");
-      CUTLASS_TRACE_DEVICE(" ProblemVisitor::SharedStorage: %d bytes", static_cast<int>(sizeof(ProblemVisitor::SharedStorage)));
-      CUTLASS_TRACE_DEVICE(" Mma::SharedStorage: %d bytes", static_cast<int>(sizeof(Mma::SharedStorage)));
-      CUTLASS_TRACE_DEVICE(" Epilogue::SharedStorage: %d bytes", static_cast<int>(sizeof(Epilogue::SharedStorage)));
-
       // LayoutB should be RowMajor
       using TileDequanterB = TileDequanter<ElementB, ElementScale, ThreadblockShape::kK, ThreadblockShape::kN, QuantMethod>;
       __shared__ typename TileDequanterB::SharedStorage dequant_storage_B;
-      CUTLASS_TRACE_DEVICE(" TileDequanter::SharedStorage: %d bytes", static_cast<int>(sizeof(dequant_storage_B)));
 
       //
       // Problem visitor.
@@ -498,8 +494,12 @@ struct MoeFCGemm {
         GemmCoord problem_size = problem_visitor.problem_size();
         int32_t problem_idx = problem_visitor.problem_index();
         int32_t cta_idx = int32_t(problem_visitor.threadblock_idx());
-        CUTLASS_TRACE_DEVICE(" problem_idx: %d, cta_idx: %d, problem_size: {%d, %d, %d}",
-            problem_idx, cta_idx, static_cast<int>(problem_size.m()), static_cast<int>(problem_size.n()), static_cast<int>(problem_size.k()));
+        //CUTLASS_TRACE_DEVICE_TID(" problem_idx: %d, cta_idx: %d, problem_size: {%d, %d, %d}",
+        //    problem_idx, cta_idx, static_cast<int>(problem_size.m()), static_cast<int>(problem_size.n()), static_cast<int>(problem_size.k()));
+
+        //if (problem_idx > 128) {
+        //  break;
+        //}
 
         GemmCoord grid_shape = problem_visitor.grid_shape(problem_size);
 
@@ -511,7 +511,7 @@ struct MoeFCGemm {
 
         // begin address offset for weight_scale.
         ElementScale* weight_scale_ptr =
-            params.weight_scales + problem_idx * problem_size.n();
+            params.weight_scales ? params.weight_scales + problem_idx * problem_size.n() : nullptr;
         // the begin threadblock_offset of scale, which holds the same column id with C, but with no row id
         cutlass::MatrixCoord tb_offset_scale{0, threadblock_offset.n()};
 
@@ -557,14 +557,14 @@ struct MoeFCGemm {
         int thread_idx = threadIdx.x;
 
         // Construct iterators to A and B operands
-        CUTLASS_TRACE_DEVICE(" iterator_A, ptr_A=%p, ldm_A=%ld", ptr_A, ldm_A);
+        //CUTLASS_TRACE_DEVICE(" iterator_A, ptr_A=%p, ldm_A=%ld", ptr_A, ldm_A);
         typename Mma::IteratorA iterator_A(LayoutA(ldm_A),
                                            ptr_A,
                                            {problem_size.m(), problem_size.k()},
                                            thread_idx,
                                            tb_offset_A);
 
-        CUTLASS_TRACE_DEVICE(" iterator_B, ptr_B=%p, ldm_B=%ld", ptr_B, ldm_B);
+        //CUTLASS_TRACE_DEVICE(" iterator_B, ptr_B=%p, ldm_B=%ld", ptr_B, ldm_B);
         typename Mma::IteratorB iterator_B(
             LayoutB(TileDequanterB::kUseSharedMemory ? ldm_B_shared : ldm_B),
             ptr_B,
@@ -600,7 +600,7 @@ struct MoeFCGemm {
         // Compute threadblock-scoped matrix multiply-add
         int gemm_k_iterations =
             (problem_size.k() + Mma::Shape::kK - 1) / Mma::Shape::kK;
-        CUTLASS_TRACE_DEVICE(" gemm_k: %d, gemm_k_iterations: %d", problem_size.k(), gemm_k_iterations);
+        //CUTLASS_TRACE_DEVICE(" gemm_k: %d, gemm_k_iterations: %d", problem_size.k(), gemm_k_iterations);
 
         // Wait for all threads to finish their epilogue phases from the
         // previous tile.
@@ -626,7 +626,7 @@ struct MoeFCGemm {
         EpilogueOutputOp output_op(params.output_op);
 
         ElementC* ptr_C =
-            reinterpret_cast<ElementC*>(params.ptr_C) + problem_idx * gemm_n;
+            params.ptr_C ? reinterpret_cast<ElementC*>(params.ptr_C) + problem_idx * gemm_n : nullptr;
         ElementC* ptr_D =
             reinterpret_cast<ElementC*>(params.ptr_D) + rows_to_jump * gemm_n;
 
@@ -637,7 +637,7 @@ struct MoeFCGemm {
         typename Epilogue::OutputTileIterator::Params params_D(layout_D);
 
         // Tile iterator loading from source tensor.
-        CUTLASS_TRACE_DEVICE(" iterator_C, ptr_C=%p", ptr_C);
+        //CUTLASS_TRACE_DEVICE(" iterator_C, ptr_C=%p", ptr_C);
         typename Epilogue::OutputTileIterator iterator_C(
             params_C,
             ptr_C,
@@ -646,7 +646,7 @@ struct MoeFCGemm {
             threadblock_offset.mn());
 
         // Tile iterator writing to destination tensor.
-        CUTLASS_TRACE_DEVICE(" iterator_D, ptr_D=%p", ptr_D);
+        //CUTLASS_TRACE_DEVICE(" iterator_D, ptr_D=%p", ptr_D);
         typename Epilogue::OutputTileIterator iterator_D(
             params_D,
             ptr_D,

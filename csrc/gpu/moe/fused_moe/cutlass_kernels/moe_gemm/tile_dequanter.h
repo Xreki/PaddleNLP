@@ -55,9 +55,7 @@ struct TileDequanter {
   void AddTileOffset(const cutlass::MatrixCoord &tile_offset) {}
 
   CUTLASS_DEVICE
-  void Apply() {
-    CUTLASS_TRACE_DEVICE(" dequant shared memory size: {%ld, %ld} * %d", kRows, kColumns, static_cast<int>(sizeof(MmaElementT)));
-  }
+  void Apply() {}
 };
 
 template <typename MmaElementT, typename ScaleElementT, int Rows, int Columns, wintx::WintQuantMethod Method>
@@ -101,14 +99,17 @@ struct TileDequanter<MmaElementT, ScaleElementT, Rows, Columns, Method, std::ena
       tb_offset(tb_offset),
       super_scale_ptr(super_scale_ptr),
       extent_scale(extent_scale),
-      tb_offset_scale(tb_offset_scale) {}
+      tb_offset_scale(tb_offset_scale) {
+    //CUTLASS_TRACE_DEVICE(" TileDequanter::SharedStorage: {%d, %d} * %d = %d bytes",
+    //    kRows, kColumns, static_cast<int>(sizeof(MmaElementT)), static_cast<int>(sizeof(SharedStorage)));
+  }
 
   CUTLASS_DEVICE
   MmaElementT* GetOutPtr() { return smem_ptr; }
 
   CUTLASS_DEVICE
   void AddTileOffset(const cutlass::MatrixCoord &tile_offset) {
-    CUTLASS_TRACE_DEVICE(" [TileDequanter] tile_offset={%d, %d}", static_cast<int>(tile_offset.row()), static_cast<int>(tile_offset.column()));
+    //CUTLASS_TRACE_DEVICE(" [TileDequanter] tile_offset={%d, %d}", static_cast<int>(tile_offset.row()), static_cast<int>(tile_offset.column()));
     tb_offset.row() += tile_offset.row() * kRows;
     tb_offset.column() += tile_offset.column() * kColumns;
     tb_offset_scale.column() += tile_offset.column() * kColumns;
@@ -118,14 +119,12 @@ struct TileDequanter<MmaElementT, ScaleElementT, Rows, Columns, Method, std::ena
   void Apply() {
     int fake_value = static_cast<int>(tb_offset.row()) / kRows;
     if (tb_offset.row() >= extent.row() || tb_offset.column() >= extent.column()) {
-      CUTLASS_TRACE_DEVICE(" [TileDequanter] SharedStorage: {%d, %d} * %d bytes; tb_offset={%d, %d}, skipped!!!",
-          kRows, kColumns, static_cast<int>(sizeof(MmaElementT)),
-          static_cast<int>(tb_offset.row()), static_cast<int>(tb_offset.column()));
+      //CUTLASS_TRACE_DEVICE(" TileDequanter::Apply, tb_offset={%d, %d}, skipped!!!",
+      //    static_cast<int>(tb_offset.row()), static_cast<int>(tb_offset.column()));
       return;
     } else {
-      CUTLASS_TRACE_DEVICE(" [TileDequanter] SharedStorage: {%d, %d} * %d bytes; tb_offset={%d, %d}, fake_value={%d}",
-          kRows, kColumns, static_cast<int>(sizeof(MmaElementT)),
-          static_cast<int>(tb_offset.row()), static_cast<int>(tb_offset.column()), fake_value);
+      //CUTLASS_TRACE_DEVICE(" TileDequanter::Apply, tb_offset={%d, %d}, fake_value={%d}",
+      //    static_cast<int>(tb_offset.row()), static_cast<int>(tb_offset.column()), fake_value);
     }
 
     MmaElementT* out_ptr = smem_ptr;
@@ -134,18 +133,7 @@ struct TileDequanter<MmaElementT, ScaleElementT, Rows, Columns, Method, std::ena
     ElementT* in_ptr = reinterpret_cast<ElementT*>(pointer) + zipped_row * ldm + tb_offset.column();
     ScaleElementT* scale_ptr = super_scale_ptr + tb_offset_scale.column();
 
-#if 1
     UnzipFunctor unzip_functor;
     unzip_functor(in_ptr, scale_ptr, out_ptr, ldm);
-#else
-    int32_t thread_idx = threadIdx.x;
-    int32_t num_threads = blockDim.x;
-    for (int col = thread_idx; col < kColumns; col += num_threads) {
-      for (int row = 0; row < kRows; ++row) {
-        out_ptr[row * kColumns + col] = static_cast<MmaElementT>(fake_value);
-      }
-    }
-    __syncthreads();
-#endif
   }
 };
