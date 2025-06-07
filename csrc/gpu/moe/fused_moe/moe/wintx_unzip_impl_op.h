@@ -42,6 +42,14 @@ struct UnzipFunctor<T, wintx::WintQuantMethod::kWeightOnlyInt25, TileRows, TileC
   using ZippedT = uint16_t;
   using ScaleComputeT = float;
 
+  __device__ inline T Compute(int32_t zipped_value, int32_t shift_bit, ScaleComputeT scale) {
+    int32_t shifted_value = (zipped_value >> shift_bit) & WeightOnlyTraits::kWeightMask;
+    int32_t value = shifted_value - WeightOnlyTraits::kBBZip;
+
+    ScaleComputeT scaled_value = static_cast<ScaleComputeT>(value) * scale;
+    return static_cast<T>(scaled_value);
+  }
+
   __device__ void operator()(const uint16_t *in_ptr, const T* supper_scale_ptr, T *out_ptr, const int64_t in_stride) {
     using ZippedT = typename WeightOnlyTraits::ZippedT;
     int32_t shift_bits[7] = {13, 11, 9, 6, 4, 2, 0};
@@ -49,30 +57,39 @@ struct UnzipFunctor<T, wintx::WintQuantMethod::kWeightOnlyInt25, TileRows, TileC
     int tid = threadIdx.x;
     int num_threads = blockDim.x;
 
+    #pragma unroll
     for (int col = tid; col < TileColumns; col += num_threads) {
       ScaleComputeT super_scale = static_cast<ScaleComputeT>(supper_scale_ptr[col]);
 
-      for (int row = 0; row < TileRows; ++row) {
-        int row_in_group = row % 64;
-        int group_id = row / 64;
+      #pragma unroll
+      for (int group_id = 0; group_id < TileRows / 64; ++group_id) {
+        // the last row in group
+        int zipped_row_last = group_id * 10 + 9;
+        int zipped_offset_last = zipped_row_last * in_stride + col;
+        int32_t zipped_value_last = static_cast<int32_t>(in_ptr[zipped_offset_last]);
 
-        int zipped_local_scale_row = (group_id + 1) * 10 - 1;
-        int zipped_local_scale_offset = zipped_local_scale_row * in_stride + col;
-        ZippedT zipped_local_scale = in_ptr[zipped_local_scale_offset];
-        int32_t local_scale = static_cast<int32_t>(zipped_local_scale) & WeightOnlyTraits::kLocalScaleMask;
+        ScaleComputeT local_scale = static_cast<ScaleComputeT>(zipped_value_last & WeightOnlyTraits::kLocalScaleMask);
+        ScaleComputeT scale = local_scale * super_scale;
 
-        int shift_bit_id = row_in_group % 7;
-        ZippedT shift_bit = shift_bits[shift_bit_id];
+        #pragma unroll
+        for (int zipped_row_in_group = 0; zipped_row_in_group < 9; ++zipped_row_in_group) {
+          int zipped_row = group_id * 10 + zipped_row_in_group;
+          int zipped_offset = zipped_row * in_stride + col;
+          int32_t zipped_value = static_cast<int32_t>(in_ptr[zipped_offset]);
 
-        int zipped_row = group_id * 10 + (row_in_group / 7);
-        int zipped_offset = zipped_row * in_stride + col;
-        ZippedT zipped_value = in_ptr[zipped_offset];
-        int32_t shifted_value = (static_cast<int32_t>(zipped_value) >> shift_bit) & WeightOnlyTraits::kWeightMask;
-        int32_t value = static_cast<int32_t>(shifted_value) - WeightOnlyTraits::kBBZip;
+          int row_in_group = group_id * 64 + zipped_row_in_group * 7;
 
-        ScaleComputeT scaled_value = static_cast<ScaleComputeT>(value) * static_cast<ScaleComputeT>(local_scale) * super_scale;
+          #pragma unroll
+          for (int shift_bit_id = 0; shift_bit_id < 7; ++shift_bit_id) {
+            int32_t shift_bit = shift_bits[shift_bit_id];
+            T value = Compute(zipped_value, shift_bit, scale);
+            out_ptr[(row_in_group + shift_bit_id) * TileColumns + col] = value;
+          }
+        }
 
-        out_ptr[row * TileColumns + col] = static_cast<T>(scaled_value);
+        int row_in_group_last = group_id * 64 + 63;
+        T value_last = Compute(zipped_value_last, shift_bits[0], scale);
+        out_ptr[row_in_group_last * TileColumns + col] = value_last;
       }
     }
     __syncthreads();
