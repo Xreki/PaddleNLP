@@ -13,15 +13,13 @@
 # limitations under the License.
 
 import os
-
-test_paddlenlp = int(os.getenv("TEST_PADDLENLP", 1))
-
-import contextlib
 import sys
+import time
 
 import numpy as np
 import paddle
 
+test_paddlenlp = int(os.getenv("TEST_PADDLENLP", 1))
 if test_paddlenlp:
     print("import moe_expert_ffn from paddlenlp_ops")
     from paddlenlp_ops import (
@@ -37,9 +35,10 @@ else:
 from test_utils import check_result, load_all_tensors, print_tensor_info
 from wintx_reference import moe_group_gemm, unzip_and_dequant_wint2_5
 
-enable_triton = False
+enable_triton = True
 if enable_triton:
-    from paddlenlp.experimental.wintx.wintx_fused_moe_decode import (
+    # from paddlenlp.experimental.wintx.wintx_fused_moe_decode import (
+    from moe_wintx_triton import (
         fused_moe_wintx_decode_wint2_5,
         fused_moe_wintx_decode_wint2_75,
     )
@@ -56,6 +55,7 @@ class MoEArguments:
         ffn2_weights_scale,
         hidden_states=None,
         scores=None,
+        gate_correction_bias=None,
         topk=8,
         dump_dir=None,
     ):
@@ -67,16 +67,9 @@ class MoEArguments:
         self.ffn2_weights_scale = ffn2_weights_scale
         self.hidden_states = hidden_states
         self.scores = scores
+        self.gate_correction_bias = gate_correction_bias
         self.topk = topk
         self.dump_dir = dump_dir
-
-
-def get_profile_iters(profile):
-    if profile:
-        warmup, repeat = 5, 100
-    else:
-        warmup, repeat = 0, 1
-    return warmup, repeat
 
 
 def generate_fake_weight(w_shape, w_dtype, tile_shape):
@@ -238,6 +231,7 @@ def prepare_args_wint2_5_ernie45t(test_dir):
         ffn2_weights_scale=tensor_dict[f"moe_ffn2_super_scales{i}"],
         hidden_states=tensor_dict[f"x{i}"],
         scores=tensor_dict[f"scores{i}"],
+        gate_correction_bias=tensor_dict[f"gate_correction_bias{i}"],
         topk=tensor_dict[f"top_k{i}"],
         dump_dir=dump_dir,
     )
@@ -245,56 +239,92 @@ def prepare_args_wint2_5_ernie45t(test_dir):
 
 
 def run_moe_decode_wint2_5_triton(moe_args, profile=False):
-    moe_out = fused_moe_wintx_decode_wint2_5(
-        hidden_states=moe_args.hidden_states,
-        w1=moe_args.ffn1_weights,
-        w2=moe_args.ffn2_weights,
-        scores=moe_args.scores,
-        topk=moe_args.topk,
-        w1_scale=moe_args.ffn1_weights_scale,
-        w2_scale=moe_args.ffn2_weights_scale,
-    )
-    return moe_out
+    warmup, repeat = 5, 100
+    begin_time = time.time()
+    for i in range(warmup + repeat):
+        if i == warmup:
+            paddle.device.synchronize()
+            begin_time = time.time()
+            if profile:
+                paddle.base.core.nvprof_start()
+
+        moe_out = fused_moe_wintx_decode_wint2_5(
+            hidden_states=moe_args.hidden_states,
+            w1=moe_args.ffn1_weights,
+            w2=moe_args.ffn2_weights,
+            scores=moe_args.scores,
+            gate_correction_bias=moe_args.gate_correction_bias,
+            topk=moe_args.topk,
+            w1_scale=moe_args.ffn1_weights_scale,
+            w2_scale=moe_args.ffn2_weights_scale,
+        )
+    if profile:
+        paddle.base.core.nvprof_stop()
+    paddle.device.synchronize()
+    timecost = ((time.time() - begin_time) / repeat) * 1000.0
+    return moe_out, timecost
 
 
 def run_moe_decode_wint2_5(moe_args, profile=False):
-    (
-        permute_input,
-        token_nums_per_expert,
-        permute_indices_per_token,
-        topk_weights,
-        topk_indices,
-    ) = moe_expert_dispatch(moe_args.hidden_states, moe_args.scores, moe_args.topk, False, topk_only_mode=True)
-    paddle.save(permute_input, os.path.join(moe_args.dump_dir, "permute_input"))
-    paddle.save(token_nums_per_expert, os.path.join(moe_args.dump_dir, "token_nums_per_expert"))
-    ffn_out = moe_expert_ffn(
-        permute_input,
-        token_nums_per_expert,
-        moe_args.ffn1_weights,
-        moe_args.ffn2_weights,
-        None,
-        moe_args.ffn1_weights_scale,
-        moe_args.ffn2_weights_scale,
-        "weight_only_int2.5",
-    )
-    moe_out = moe_expert_reduce(
-        ffn_out,
-        topk_weights,
-        permute_indices_per_token,
-        topk_indices,
-        None,
-        norm_topk_prob=False,  # 在noaux_tc中做了
-        routed_scaling_factor=1.0,  # 在noaux_tc中做了
-    )
-    return moe_out
+    warmup, repeat = 5, 100
+    begin_time = time.time()
+    for i in range(warmup + repeat):
+        if i == warmup:
+            paddle.device.synchronize()
+            begin_time = time.time()
+            if profile:
+                paddle.base.core.nvprof_start()
+
+        scores = moe_args.gate_correction_bias + moe_args.scores
+        _, topk_indices = paddle.topk(scores, k=moe_args.topk, axis=-1)
+        (
+            permute_input,
+            token_nums_per_expert,
+            permute_indices_per_token,
+            topk_weights,
+            _,
+        ) = moe_expert_dispatch(moe_args.hidden_states, moe_args.scores, moe_args.topk, False, topk_only_mode=True)
+
+        topk_indices = topk_indices.cast("int32")
+        topk_weights = topk_weights / topk_weights.sum(axis=-1, keepdim=True)
+
+        # paddle.save(permute_input, os.path.join(moe_args.dump_dir, "permute_input"))
+        # paddle.save(token_nums_per_expert, os.path.join(moe_args.dump_dir, "token_nums_per_expert"))
+        ffn_out = moe_expert_ffn(
+            permute_input,
+            token_nums_per_expert,
+            moe_args.ffn1_weights,
+            moe_args.ffn2_weights,
+            None,
+            moe_args.ffn1_weights_scale,
+            moe_args.ffn2_weights_scale,
+            "weight_only_int2.5",
+        )
+        moe_out = moe_expert_reduce(
+            ffn_out,
+            topk_weights,
+            permute_indices_per_token,
+            topk_indices,
+            None,
+            norm_topk_prob=False,  # 在noaux_tc中做了
+            routed_scaling_factor=1.0,  # 在noaux_tc中做了
+        )
+    if profile:
+        paddle.base.core.nvprof_stop()
+    paddle.device.synchronize()
+    timecost = ((time.time() - begin_time) / repeat) * 1000.0
+    return moe_out, timecost
 
 
 def run_moe_ffn_wint2_5(moe_args, profile=False):
-    warmup, repeat = get_profile_iters(profile)
+    warmup, repeat = 5, 100
+    begin_time = time.time()
     for i in range(warmup + repeat):
-        if profile and i == warmup:
+        if i == warmup:
             paddle.device.synchronize()
-            paddle.base.core.nvprof_start()
+            begin_time = time.time()
+            if profile:
+                paddle.base.core.nvprof_start()
         ffn_out = moe_expert_ffn(
             moe_args.permute_input,
             moe_args.tokens_expert_prefix_sum,
@@ -307,17 +337,21 @@ def run_moe_ffn_wint2_5(moe_args, profile=False):
         )
     if profile:
         paddle.base.core.nvprof_stop()
-        paddle.device.synchronize()
-    return ffn_out
+    paddle.device.synchronize()
+    timecost = ((time.time() - begin_time) / repeat) * 1000.0
+    return ffn_out, timecost
 
 
 def run_moe_ffn_bf16_with_wint2_5_weights(moe_args, profile=False):
     quant_type = "weight_only_int2.5"
-    warmup, repeat = get_profile_iters(profile)
+    warmup, repeat = 5, 100
+    begin_time = time.time()
     for i in range(warmup + repeat):
-        if profile and i == warmup:
+        if i == warmup:
             paddle.device.synchronize()
-            paddle.base.core.nvprof_start()
+            begin_time = time.time()
+            if profile:
+                paddle.base.core.nvprof_start()
 
         if True:
             unzipped_ffn1_weights = winx_unzip(
@@ -343,21 +377,65 @@ def run_moe_ffn_bf16_with_wint2_5_weights(moe_args, profile=False):
         )
     if profile:
         paddle.base.core.nvprof_stop()
-        paddle.device.synchronize()
-    return ffn_out
+    paddle.device.synchronize()
+    timecost = ((time.time() - begin_time) / repeat) * 1000.0
+    return ffn_out, timecost
+
+
+def run_moe_ffn_wint4_with_wint2_5_shape(moe_args, profile=False):
+    num_experts = moe_args.ffn1_weights_scale.shape[0]
+    intermedia_size = moe_args.ffn1_weights_scale.shape[1] // 2
+    hidden_size = moe_args.ffn2_weights_scale.shape[1]
+
+    randn_ffn1_weights = paddle.randint(
+        low=0, high=255, shape=[num_experts, hidden_size, intermedia_size], dtype="int32"
+    ).cast("int8")
+    randn_ffn2_weights = paddle.randint(
+        low=0, high=255, shape=[num_experts, intermedia_size // 2, hidden_size], dtype="int32"
+    ).cast("int8")
+
+    quant_type = ""
+    warmup, repeat = 5, 100
+    begin_time = time.time()
+    for i in range(warmup + repeat):
+        if i == warmup:
+            paddle.device.synchronize()
+            begin_time = time.time()
+            if profile:
+                paddle.base.core.nvprof_start()
+
+        ffn_out = moe_expert_ffn(
+            moe_args.permute_input,
+            moe_args.tokens_expert_prefix_sum,
+            randn_ffn1_weights,
+            randn_ffn2_weights,
+            None,
+            moe_args.ffn1_weights_scale,
+            moe_args.ffn2_weights_scale,
+            "weight_only_int4",
+        )
+    if profile:
+        paddle.base.core.nvprof_stop()
+    paddle.device.synchronize()
+    timecost = ((time.time() - begin_time) / repeat) * 1000.0
+    return ffn_out, timecost
 
 
 def test_main_wint2_5(test_dir):
     # moe_args = prepare_args_wint2_5_v1(test_dir)
     moe_args = prepare_args_wint2_5_ernie45t(test_dir)
 
-    compare_with_triton = False
-    if compare_with_triton:
-        out_wint = run_moe_decode_wint2_5(moe_args, profile=False)
-        # out_base = run_moe_decode_wint2_5_triton(moe_args, profile=False)
+    if enable_triton:
+        out_wint, timecost_cutlass = run_moe_decode_wint2_5(moe_args, profile=False)
+        out_base, timecost_triton = run_moe_decode_wint2_5_triton(moe_args, profile=False)
+        print(f"[Time Cost] wint2.5_cutlass: {timecost_cutlass:.5f} ms; wint2.5_triton: {timecost_triton:.5f} ms")
     else:
-        out_wint = run_moe_ffn_wint2_5(moe_args, profile=False)
-        out_base = run_moe_ffn_bf16_with_wint2_5_weights(moe_args, profile=True)
+        out_wint, timecost_wint = run_moe_ffn_wint2_5(moe_args, profile=True)
+        out_base, timecost_bf16 = run_moe_ffn_bf16_with_wint2_5_weights(moe_args, profile=False)
+        _, timecost_wint4 = run_moe_ffn_wint4_with_wint2_5_shape(moe_args, profile=False)
+        print(
+            f"[Time Cost] wint2.5: {timecost_wint:0.5f} ms; bf16: {timecost_bf16:.5f} ms; wint4: {timecost_wint4:.5f} ms"
+        )
 
     print_tensor_info(out_wint, "out_wint")
     out_wint = paddle.cast(out_wint, dtype="float32")
