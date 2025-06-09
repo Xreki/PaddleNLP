@@ -308,6 +308,8 @@ struct MoeFCGemm {
       CUTLASS_TRACE_HOST("[Arguments] LayoutA: " << wintx::GetCutlassLayoutString<LayoutA>());
       CUTLASS_TRACE_HOST("[Arguments] LayoutB: " << wintx::GetCutlassLayoutString<LayoutB>());
       CUTLASS_TRACE_HOST("[Arguments] LayoutC: " << wintx::GetCutlassLayoutString<LayoutC>());
+      CUTLASS_TRACE_HOST("[Arguments] Mma::IteratorA::AccessType::kElements:" << Mma::IteratorA::AccessType::kElements);
+      CUTLASS_TRACE_HOST("[Arguments] Mma::IteratorB::AccessType::kElements:" << Mma::IteratorB::AccessType::kElements);
       CUTLASS_TRACE_HOST("[Arguments] SharedStorage Information:");
       CUTLASS_TRACE_HOST(" - ProblemVisitor::SharedStorage: " << sizeof(typename ProblemVisitor::SharedStorage) << " bytes");
       CUTLASS_TRACE_HOST(" - Mma::SharedStorage: " << sizeof(typename Mma::SharedStorage) << " bytes");
