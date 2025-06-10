@@ -474,7 +474,7 @@ struct MoeFCGemm {
           "B must be row major/col major OR col major interleaved.");
 
       // LayoutB should be RowMajor
-      using TileDequanterB = TileDequanter<ElementB, ElementScale, ThreadblockShape::kK, ThreadblockShape::kN, QuantMethod>;
+      using TileDequanterB = TileDequanter<ElementB, ElementScale, ThreadblockShape::kK, ThreadblockShape::kN, kThreadCount, QuantMethod>;
       __shared__ typename TileDequanterB::SharedStorage dequant_storage_B;
 
       //
@@ -489,7 +489,7 @@ struct MoeFCGemm {
       const int64_t packed_gemm_k = QuantMethod == wintx::WintQuantMethod::kWeightOnlyInt25 ? wintx::WintTypeTraits<QuantMethod>::CaclPackedDim(gemm_k) : gemm_k;
       int64_t bytes_per_expert_matrix = (packed_gemm_k * gemm_n / 8) * cutlass::sizeof_bits<PackedElementB>::value;
 
-      CUTLASS_TRACE_DEVICE(" gemm_k: %ld, gemm_n: %ld, bytes_per_expert_matrix: %ld, kInterleave: %d", gemm_k, gemm_n, bytes_per_expert_matrix, kInterleave);
+      //CUTLASS_TRACE_DEVICE(" gemm_k: %ld, gemm_n: %ld, bytes_per_expert_matrix: %ld, kInterleave: %d", gemm_k, gemm_n, bytes_per_expert_matrix, kInterleave);
 
       // Outer 'persistent' loop to iterate over tiles
       while (problem_visitor.next_tile()) {

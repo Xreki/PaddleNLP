@@ -35,7 +35,7 @@ else:
 from test_utils import check_result, load_all_tensors, print_tensor_info
 from wintx_reference import moe_group_gemm, unzip_and_dequant_wint2_5
 
-enable_triton = True
+enable_triton = False
 if enable_triton:
     # from paddlenlp.experimental.wintx.wintx_fused_moe_decode import (
     from moe_wintx_triton import (
@@ -353,7 +353,7 @@ def run_moe_ffn_bf16_with_wint2_5_weights(moe_args, profile=False):
             if profile:
                 paddle.base.core.nvprof_start()
 
-        if True:
+        if i == 0:
             unzipped_ffn1_weights = winx_unzip(
                 zipped_weight=moe_args.ffn1_weights,
                 super_scale=moe_args.ffn1_weights_scale,
@@ -426,11 +426,12 @@ def test_main_wint2_5(test_dir):
     moe_args = prepare_args_wint2_5_ernie45t(test_dir)
 
     if enable_triton:
-        out_wint, timecost_cutlass = run_moe_decode_wint2_5(moe_args, profile=False)
+        out_wint, timecost_cutlass = run_moe_decode_wint2_5(moe_args, profile=True)
         out_base, timecost_triton = run_moe_decode_wint2_5_triton(moe_args, profile=False)
         print(f"[Time Cost] wint2.5_cutlass: {timecost_cutlass:.5f} ms; wint2.5_triton: {timecost_triton:.5f} ms")
     else:
-        out_wint, timecost_wint = run_moe_ffn_wint2_5(moe_args, profile=True)
+        timecost_wint4 = 0.0
+        out_wint, timecost_wint = run_moe_ffn_wint2_5(moe_args, profile=False)
         out_base, timecost_bf16 = run_moe_ffn_bf16_with_wint2_5_weights(moe_args, profile=False)
         _, timecost_wint4 = run_moe_ffn_wint4_with_wint2_5_shape(moe_args, profile=False)
         print(

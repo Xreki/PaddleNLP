@@ -13,14 +13,13 @@
 # limitations under the License.
 
 import os
-import time
 import shutil
 import subprocess
+import time
 
 import paddle
 from packaging.version import Version, parse
 from paddle.utils.cpp_extension import CUDAExtension, setup
-
 
 build_begin_time = time.time()
 sm_version = int(os.getenv("CUDA_SM_VERSION", "0"))
@@ -181,6 +180,7 @@ if cc >= 80:
     # sources += find_end_files("./gpu/append_attn/template_instantiation", ".cu")
     sources += find_end_files("./gpu/moe/fused_moe/cutlass_kernels/moe_gemm/", ".cu")
     sources += find_end_files("./gpu/moe/fused_moe/", ".cu")
+    # sources += "./gpu/moe/fused_moe/wintx_unzip.cu",
     # sources += "./gpu/cpp_extensions.cu",
 
 
@@ -189,7 +189,7 @@ if os.path.isdir(fp8_auto_gen_directory):
     shutil.rmtree(fp8_auto_gen_directory)
 
 
-#if cc == 89 and cuda_version >= 12.4:
+# if cc == 89 and cuda_version >= 12.4:
 #    os.system("python utils/auto_gen_fp8_fp8_gemm_fused_kernels.py --cuda_arch 89")
 #    os.system("python utils/auto_gen_fp8_fp8_dual_gemm_fused_kernels.py --cuda_arch 89")
 #    sources += find_end_files(fp8_auto_gen_directory, ".cu")
@@ -221,7 +221,7 @@ if os.path.isdir(fp8_auto_gen_directory):
 #        ]
 #        nvcc_compile_args += ["-gencode", "arch=compute_90a,code=compute_90a"]
 
-#if cc >= 90 and cuda_version >= 12.0:
+# if cc >= 90 and cuda_version >= 12.0:
 #    os.system("python utils/auto_gen_fp8_fp8_gemm_fused_kernels_sm90.py --cuda_arch 90")
 #    os.system("python utils/auto_gen_fp8_fp8_gemm_fused_kernels_ptr_scale_sm90.py --cuda_arch 90")
 #    os.system("python utils/auto_gen_fp8_fp8_dual_gemm_fused_kernels_sm90.py --cuda_arch 90")

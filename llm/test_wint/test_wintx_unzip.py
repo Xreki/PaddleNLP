@@ -14,27 +14,12 @@
 
 import os
 import sys
+import time
 
 import paddle
 from paddlenlp_ops import winx_unzip
+from test_utils import load_all_tensors, print_tensor_info
 from wintx_reference import unzip_and_dequant_wint2_5
-
-
-def print_tensor_info(t, name):
-    if t is not None:
-        print(f"-- [print_tensor_info] {name}: shape={t.shape}, dtype={t.dtype}")
-    else:
-        print(f"-- [print_tensor_info] {name}: tensor is {t}")
-
-
-def load_all_tensors(tensor_names, dump_dir):
-    tensor_dict = {}
-    for name in tensor_names:
-        key = name.replace(".pdparams", "").replace("_layer1", "")
-        filepath = os.path.join(dump_dir, name)
-        tensor_dict[key] = paddle.load(filepath)
-        print_tensor_info(tensor_dict[key], name)
-    return tensor_dict
 
 
 def check_equal(target, reference):
@@ -49,14 +34,34 @@ def check_equal(target, reference):
             for j in range(target_shape[1]):
                 for k in range(target_shape[2]):
                     if target_np[i, j, k] != reference_np[i, j, k]:
-                        print(
-                            f"-- [{i}, {j}, {k}] mismatch: {target_np[i, j, k]} vs {reference_np[i, j, k]}"
-                        )
+                        print(f"-- [{i}, {j}, {k}] mismatch: {target_np[i, j, k]} vs {reference_np[i, j, k]}")
                         sys.exit(0)
     else:
         print("unziped_weight is equal to reference!")
 
     # np.testing.assert_array_equal(target_np, reference_np)
+
+
+def run_wintx_unzip(weight, weights_scale, quant_type, profile=False):
+    warmup, repeat = 5, 100
+    begin_time = time.time()
+    for i in range(warmup + repeat):
+        if i == warmup:
+            paddle.device.synchronize()
+            begin_time = time.time()
+            if profile:
+                paddle.base.core.nvprof_start()
+
+        unzipped_weight = winx_unzip(
+            weight,
+            weights_scale,
+            quant_type,
+        )
+    if profile:
+        paddle.base.core.nvprof_stop()
+    paddle.device.synchronize()
+    timecost = ((time.time() - begin_time) / repeat) * 1000.0
+    return unzipped_weight, timecost
 
 
 def test_main_wint2_5_unzip(test_dir):
@@ -68,22 +73,16 @@ def test_main_wint2_5_unzip(test_dir):
     tensor_dict = load_all_tensors(tensor_names, dump_dir)
 
     ffn1_weight = tensor_dict["ffn1_weights"]
-    ffn1_weights_scale = tensor_dict["ffn1_weights_scale"][:, 0, :]
+    ffn1_weights_scale = tensor_dict["ffn1_weights_scale"][:, 0, :].contiguous()
 
     quant_type = "weight_only_int2.5"
-    unzipped_weight = winx_unzip(
-        ffn1_weight,
-        ffn1_weights_scale,
-        quant_type,
-    )
-    # print("unzipped_weight[1, 0, 0:6]：", unzipped_weight[1, 0, 0:6].cast("float32"))
+    unzipped_weight, _ = run_wintx_unzip(ffn1_weight, ffn1_weights_scale, quant_type, profile=True)
 
-    unziped_weight_reference = unzip_and_dequant_wint2_5(
+    unzipped_weight_reference = unzip_and_dequant_wint2_5(
         zipped_weight=ffn1_weight, super_scale=ffn1_weights_scale, scale_compute_dtype=paddle.float32
     )
-    # print("unziped_weight_reference[1, 0, 0:6]:", unziped_weight_reference[1, 0, 0:6].astype("float32"))
 
-    check_equal(unzipped_weight, unziped_weight_reference)
+    check_equal(unzipped_weight, unzipped_weight_reference)
 
 
 def test_main(test_dir):

@@ -25,7 +25,7 @@ struct UseSharedMemory : std::false_type {};
 template <>
 struct UseSharedMemory<wintx::WintQuantMethod::kWeightOnlyInt25> : std::true_type {};
 
-template <typename MmaElementT, typename ScaleElementT, int Rows, int Columns, wintx::WintQuantMethod Method, typename = void>
+template <typename MmaElementT, typename ScaleElementT, int Rows, int Columns, int NumThreads, wintx::WintQuantMethod Method, typename = void>
 struct TileDequanter {
   using ElementT = typename wintx::WintTypeTraits<Method>::WeightType;
 
@@ -58,10 +58,10 @@ struct TileDequanter {
   void Apply() {}
 };
 
-template <typename MmaElementT, typename ScaleElementT, int Rows, int Columns, wintx::WintQuantMethod Method>
-struct TileDequanter<MmaElementT, ScaleElementT, Rows, Columns, Method, std::enable_if_t<UseSharedMemory<Method>::value>> {  
+template <typename MmaElementT, typename ScaleElementT, int Rows, int Columns, int NumThreads, wintx::WintQuantMethod Method>
+struct TileDequanter<MmaElementT, ScaleElementT, Rows, Columns, NumThreads, Method, std::enable_if_t<UseSharedMemory<Method>::value>> {  
   using ElementT = typename wintx::WintTypeTraits<Method>::WeightType;
-  using UnzipFunctor = UnzipFunctor<MmaElementT, Method, Rows, Columns>;
+  using UnzipAndDequantFunctor = wintx::UnzipAndDequantFunctor<MmaElementT, Method, Rows, Columns, NumThreads>;
 
   static constexpr bool kUseSharedMemory = true;
 
@@ -133,7 +133,7 @@ struct TileDequanter<MmaElementT, ScaleElementT, Rows, Columns, Method, std::ena
     ElementT* in_ptr = reinterpret_cast<ElementT*>(pointer) + zipped_row * ldm + tb_offset.column();
     ScaleElementT* scale_ptr = super_scale_ptr + tb_offset_scale.column();
 
-    UnzipFunctor unzip_functor;
-    unzip_functor(in_ptr, scale_ptr, out_ptr, ldm);
+    UnzipAndDequantFunctor unzip_and_dequant_functor;
+    unzip_and_dequant_functor(in_ptr, scale_ptr, out_ptr, ldm);
   }
 };
