@@ -16,18 +16,18 @@
 
 #include "cutlass/gemm_coord.h"
 #include "cutlass/trace.h"
-#include "wint_type_traits.h"
-#include "moe/wintx_unzip_impl_op.h"
+#include "cutlass_kernels/moe_gemm/wint_type_traits.h"
+#include "cutlass_kernels/moe_gemm/wintx_unzip_impl.h"
 
-template <wintx::WintQuantMethod Method>
+template <WintQuantMethod Method>
 struct UseSharedMemory : std::false_type {};
 
 template <>
-struct UseSharedMemory<wintx::WintQuantMethod::kWeightOnlyInt25> : std::true_type {};
+struct UseSharedMemory<WintQuantMethod::kWeightOnlyInt25> : std::true_type {};
 
-template <typename MmaElementT, typename ScaleElementT, int Rows, int Columns, int NumThreads, wintx::WintQuantMethod Method, typename = void>
+template <typename MmaElementT, typename ScaleElementT, int Rows, int Columns, int NumThreads, WintQuantMethod Method, typename = void>
 struct TileDequanter {
-  using ElementT = typename wintx::WintTypeTraits<Method>::WeightType;
+  using ElementT = typename WintTypeTraits<Method>::WeightType;
 
   static constexpr bool kUseSharedMemory = false;
 
@@ -58,10 +58,10 @@ struct TileDequanter {
   void Apply() {}
 };
 
-template <typename MmaElementT, typename ScaleElementT, int Rows, int Columns, int NumThreads, wintx::WintQuantMethod Method>
+template <typename MmaElementT, typename ScaleElementT, int Rows, int Columns, int NumThreads, WintQuantMethod Method>
 struct TileDequanter<MmaElementT, ScaleElementT, Rows, Columns, NumThreads, Method, std::enable_if_t<UseSharedMemory<Method>::value>> {  
-  using ElementT = typename wintx::WintTypeTraits<Method>::WeightType;
-  using UnzipAndDequantFunctor = wintx::UnzipAndDequantFunctor<MmaElementT, Method, Rows, Columns, NumThreads>;
+  using ElementT = typename WintTypeTraits<Method>::WeightType;
+  using UnzipAndDequantFunctor = UnzipAndDequantFunctor<MmaElementT, Method, Rows, Columns, NumThreads>;
 
   static constexpr bool kUseSharedMemory = true;
 

@@ -21,7 +21,7 @@ import paddle
 
 def print_tensor_info(t, name):
     if t is not None:
-        print(f"-- [print_tensor_info] {name}: shape={t.shape}, dtype={t.dtype}")
+        print(f"-- [print_tensor_info] {name}: shape={t.shape}, dtype={t.dtype}, data_ptr={t.data_ptr():#x}")
     else:
         print(f"-- [print_tensor_info] {name}: tensor is {t}")
 
@@ -66,6 +66,8 @@ def check_result(dtype, out_1, out_2, check_equal=False):
                 res = paddle.cast(out, dtype="float32").numpy()
             else:
                 res = out.numpy()
+        else:
+            res = out
         return res.flatten()
 
     out_1_flatten = get_flattened_array(out_1)

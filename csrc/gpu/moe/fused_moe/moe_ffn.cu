@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #pragma once
+
 #include "cutlass/numeric_conversion.h"
 #include "helper.h"
 #include "moe/fused_moe_helper.h"
@@ -83,7 +84,7 @@ void MoeFFNKernel(const paddle::Tensor& permute_input,
         inter_size,
         hidden_size,
         num_experts,
-        wintx::WintQuantMethod::kWeightOnlyInt8,
+        WintQuantMethod::kWeightOnlyInt8,
         "none",
         stream);
   } else if (quant_method == "weight_only_int4") {
@@ -99,7 +100,7 @@ void MoeFFNKernel(const paddle::Tensor& permute_input,
         inter_size,
         hidden_size,
         num_experts,
-        wintx::WintQuantMethod::kWeightOnlyInt4,
+        WintQuantMethod::kWeightOnlyInt4,
         "none",
         stream);
   } else if (quant_method == "weight_only_int2.5") {
@@ -115,7 +116,7 @@ void MoeFFNKernel(const paddle::Tensor& permute_input,
         inter_size,
         hidden_size,
         num_experts,
-        wintx::WintQuantMethod::kWeightOnlyInt25,
+        WintQuantMethod::kWeightOnlyInt25,
         "none",
         stream);
   } else {
@@ -130,7 +131,7 @@ void MoeFFNKernel(const paddle::Tensor& permute_input,
         inter_size,
         hidden_size,
         num_experts,
-        wintx::WintQuantMethod::kNone,
+        WintQuantMethod::kNone,
         "none",
         stream);
   }
@@ -151,7 +152,7 @@ void MoeFFNKernel(const paddle::Tensor& permute_input,
         hidden_size,
         inter_size / 2,
         num_experts,
-        wintx::WintQuantMethod::kWeightOnlyInt8,
+        WintQuantMethod::kWeightOnlyInt8,
         stream);
   } else if (quant_method == "weight_only_int4") {
     int4_moe_gemm_runner.moe_gemm(
@@ -165,7 +166,7 @@ void MoeFFNKernel(const paddle::Tensor& permute_input,
         hidden_size,
         inter_size / 2,
         num_experts,
-        wintx::WintQuantMethod::kWeightOnlyInt4,
+        WintQuantMethod::kWeightOnlyInt4,
         stream);
   } else if (quant_method == "weight_only_int2.5") {
     int25_moe_gemm_runner.moe_gemm(
@@ -179,7 +180,7 @@ void MoeFFNKernel(const paddle::Tensor& permute_input,
         hidden_size,
         inter_size / 2,
         num_experts,
-        wintx::WintQuantMethod::kWeightOnlyInt25,
+        WintQuantMethod::kWeightOnlyInt25,
         stream);
   } else {
     fp16_moe_gemm_runner.moe_gemm(
@@ -192,7 +193,7 @@ void MoeFFNKernel(const paddle::Tensor& permute_input,
         hidden_size,
         inter_size / 2,
         num_experts,
-        wintx::WintQuantMethod::kNone,
+        WintQuantMethod::kNone,
         stream);
   }
   //cudaDeviceSynchronize();

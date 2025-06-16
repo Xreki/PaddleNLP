@@ -44,8 +44,8 @@
 
 #include "cutlass_extensions/gemm/kernel/gemm_moe_problem_visitor.h"
 #include "cutlass_kernels/moe_gemm/tile_dequanter.h"
+#include "cutlass_kernels/moe_gemm/wint_type_traits.h"
 #include "paddle/phi/kernels/fusion/cutlass/cutlass_extensions/tile_interleaved_layout.h"
-#include "wint_type_traits.h"
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -87,7 +87,7 @@ constexpr bool NeedCompile() {
 template <
     typename Mma,
     typename TileDequanterB,
-    wintx::WintQuantMethod QuantMethod,
+    WintQuantMethod QuantMethod,
     typename ElementScale,
     typename platform::enable_if<use_dq_gemm<Mma>::value, bool>::type = true>
 CUTLASS_DEVICE static void run_mma(Mma mma,
@@ -121,7 +121,7 @@ CUTLASS_DEVICE static void run_mma(Mma mma,
 template <
     typename Mma,
     typename TileDequanterB,
-    wintx::WintQuantMethod QuantMethod,
+    WintQuantMethod QuantMethod,
     typename ElementScale,
     typename platform::enable_if<!use_dq_gemm<Mma>::value, bool>::type = true>
 CUTLASS_DEVICE static void run_mma(Mma mma,
@@ -136,7 +136,7 @@ CUTLASS_DEVICE static void run_mma(Mma mma,
                                    const int thread_idx,
                                    MatrixCoord tb_offset_scale) {
   //CUTLASS_TRACE_DEVICE(" use_dq_gemm is false");
-  //if constexpr (QuantMethod == wintx::WintQuantMethod::kWeightOnlyInt25) {
+  //if constexpr (QuantMethod == WintQuantMethod::kWeightOnlyInt25) {
     mma(gemm_k_iterations, accum, iterator_A, iterator_B, tile_dequanter_B, src_accum);
   //} else {
   //  mma(gemm_k_iterations, accum, iterator_A, iterator_B, src_accum);
@@ -239,7 +239,7 @@ struct MoeFCGemm {
     int64_t gemm_n;
     int64_t gemm_k;
 
-    wintx::WintQuantMethod quant_method;
+    WintQuantMethod quant_method;
 
     // Only used by device-level operator
     GemmCoord* host_problem_sizes;
@@ -261,7 +261,7 @@ struct MoeFCGemm {
           total_rows_before_expert(nullptr),
           gemm_n(0),
           gemm_k(0),
-          quant_method(wintx::WintQuantMethod::kNone),
+          quant_method(WintQuantMethod::kNone),
           host_problem_sizes(nullptr) {}
 
     /// Ctor
@@ -277,7 +277,7 @@ struct MoeFCGemm {
               int64_t* total_rows_before_expert,
               int64_t gemm_n,
               int64_t gemm_k,
-              wintx::WintQuantMethod quant_method,
+              WintQuantMethod quant_method,
               GemmCoord* host_problem_sizes = nullptr)
         : problem_count(problem_count),
           threadblock_count(threadblock_count),
@@ -305,9 +305,9 @@ struct MoeFCGemm {
       CUTLASS_TRACE_HOST("[Arguments] weight_scales: " << static_cast<void const*>(weight_scales));
       CUTLASS_TRACE_HOST("[Arguments] total_rows_before_expert: " << static_cast<void*>(total_rows_before_expert));
       CUTLASS_TRACE_HOST("[Arguments] quant_method: " << static_cast<int>(quant_method));
-      CUTLASS_TRACE_HOST("[Arguments] LayoutA: " << wintx::GetCutlassLayoutString<LayoutA>());
-      CUTLASS_TRACE_HOST("[Arguments] LayoutB: " << wintx::GetCutlassLayoutString<LayoutB>());
-      CUTLASS_TRACE_HOST("[Arguments] LayoutC: " << wintx::GetCutlassLayoutString<LayoutC>());
+      CUTLASS_TRACE_HOST("[Arguments] LayoutA: " << GetCutlassLayoutString<LayoutA>());
+      CUTLASS_TRACE_HOST("[Arguments] LayoutB: " << GetCutlassLayoutString<LayoutB>());
+      CUTLASS_TRACE_HOST("[Arguments] LayoutC: " << GetCutlassLayoutString<LayoutC>());
       CUTLASS_TRACE_HOST("[Arguments] Mma::IteratorA::AccessType::kElements:" << Mma::IteratorA::AccessType::kElements);
       CUTLASS_TRACE_HOST("[Arguments] Mma::IteratorB::AccessType::kElements:" << Mma::IteratorB::AccessType::kElements);
       CUTLASS_TRACE_HOST("[Arguments] SharedStorage Information:");
@@ -334,7 +334,7 @@ struct MoeFCGemm {
     ElementC* ptr_C;
     ElementC* ptr_D;
 
-    wintx::WintQuantMethod quant_method;
+    WintQuantMethod quant_method;
 
     //
     // Methods
@@ -347,7 +347,7 @@ struct MoeFCGemm {
           weight_scales(nullptr),
           ptr_C(nullptr),
           ptr_D(nullptr),
-          quant_method(wintx::WintQuantMethod::kNone) {}
+          quant_method(WintQuantMethod::kNone) {}
 
     CUTLASS_HOST_DEVICE
     Params(Arguments const& args,
@@ -411,7 +411,7 @@ struct MoeFCGemm {
   }
 
   static Status can_implement(Arguments const& args) {
-    if (args.quant_method != wintx::WintQuantMethod::kNone || platform::is_same<uint8_t, ElementB>::value ||
+    if (args.quant_method != WintQuantMethod::kNone || platform::is_same<uint8_t, ElementB>::value ||
         platform::is_same<uint4b_t, ElementB>::value) {
       if (args.weight_scales == nullptr) {
         CUTLASS_TRACE_HOST(
@@ -436,7 +436,7 @@ struct MoeFCGemm {
   // The dummy template parameter is not used and exists so that we can compile
   // this code using a standard earlier than C++17. Prior to C++17, fully
   // specialized templates HAD to exists in a namespace
-  template <wintx::WintQuantMethod QuantMethod, bool B, typename dummy = void>
+  template <WintQuantMethod QuantMethod, bool B, typename dummy = void>
   struct KernelRunner {
     CUTLASS_DEVICE
     static void run_kernel(Params const& params,
@@ -445,7 +445,7 @@ struct MoeFCGemm {
     }
   };
 
-  template <wintx::WintQuantMethod QuantMethod, typename dummy>
+  template <WintQuantMethod QuantMethod, typename dummy>
   struct KernelRunner<QuantMethod, true, dummy> {
     CUTLASS_DEVICE
     static void run_kernel(Params const& params,
@@ -462,7 +462,7 @@ struct MoeFCGemm {
       using LayoutB = typename Mma::IteratorB::Layout;
       using ElementC = typename Epilogue::OutputTileIterator::Element;
       using LayoutC = typename Epilogue::OutputTileIterator::Layout;
-      using PackedElementB = typename wintx::WintTypeTraits<QuantMethod>::WeightType;
+      using PackedElementB = typename WintTypeTraits<QuantMethod>::WeightType;
 
       static constexpr int kInterleave =
           Mma::IteratorB::Shape::kRow / Mma::Shape::kK;
@@ -486,7 +486,7 @@ struct MoeFCGemm {
       const int64_t gemm_k = params.problem_visitor.gemm_k;
       const int64_t gemm_n = params.problem_visitor.gemm_n;
       // kWeightOnlyInt25 is quantized and packed along k dimension with group_size 64.
-      const int64_t packed_gemm_k = QuantMethod == wintx::WintQuantMethod::kWeightOnlyInt25 ? wintx::WintTypeTraits<QuantMethod>::CaclPackedDim(gemm_k) : gemm_k;
+      const int64_t packed_gemm_k = QuantMethod == WintQuantMethod::kWeightOnlyInt25 ? WintTypeTraits<QuantMethod>::CaclPackedDim(gemm_k) : gemm_k;
       int64_t bytes_per_expert_matrix = (packed_gemm_k * gemm_n / 8) * cutlass::sizeof_bits<PackedElementB>::value;
 
       //CUTLASS_TRACE_DEVICE(" gemm_k: %ld, gemm_n: %ld, bytes_per_expert_matrix: %ld, kInterleave: %d", gemm_k, gemm_n, bytes_per_expert_matrix, kInterleave);
@@ -678,15 +678,15 @@ struct MoeFCGemm {
                   SharedStorage& shared_storage) {  // NOLINT
     static constexpr bool kCompileNeeded = NeedCompile<KernelArch>();
     if constexpr (std::is_same<ElementB, cutlass::bfloat16_t>::value || std::is_same<ElementB, cutlass::half_t>::value) {
-      if (params.quant_method == wintx::WintQuantMethod::kWeightOnlyInt25) {
-        KernelRunner<wintx::WintQuantMethod::kWeightOnlyInt25, kCompileNeeded>::run_kernel(params, shared_storage);
+      if (params.quant_method == WintQuantMethod::kWeightOnlyInt25) {
+        KernelRunner<WintQuantMethod::kWeightOnlyInt25, kCompileNeeded>::run_kernel(params, shared_storage);
       } else {
-        KernelRunner<wintx::WintQuantMethod::kNone, kCompileNeeded>::run_kernel(params, shared_storage);
+        KernelRunner<WintQuantMethod::kNone, kCompileNeeded>::run_kernel(params, shared_storage);
       }
     } else if constexpr (std::is_same<ElementB, uint8_t>::value) {
-      KernelRunner<wintx::WintQuantMethod::kWeightOnlyInt8, kCompileNeeded>::run_kernel(params, shared_storage);
+      KernelRunner<WintQuantMethod::kWeightOnlyInt8, kCompileNeeded>::run_kernel(params, shared_storage);
     } else if constexpr (std::is_same<ElementB, cutlass::uint4b_t>::value) {
-      KernelRunner<wintx::WintQuantMethod::kWeightOnlyInt4, kCompileNeeded>::run_kernel(params, shared_storage);
+      KernelRunner<WintQuantMethod::kWeightOnlyInt4, kCompileNeeded>::run_kernel(params, shared_storage);
     } else {
       CUTLASS_NOT_IMPLEMENTED();
     }

@@ -20,7 +20,7 @@
 #include <string>
 
 #include "paddle/phi/kernels/fusion/cutlass/cutlass_extensions/ft_gemm_configs.h"
-#include "wint_type_traits.h"
+#include "cutlass_kernels/moe_gemm/wint_type_traits.h"
 
 using namespace phi;
 
@@ -40,7 +40,7 @@ class MoeGemmRunner {
                          int64_t gemm_n,
                          int64_t gemm_k,
                          int num_experts,
-                         wintx::WintQuantMethod quant_method,
+                         WintQuantMethod quant_method,
                          std::string activation_type,
                          cudaStream_t stream);
 
@@ -53,7 +53,7 @@ class MoeGemmRunner {
                 int64_t gemm_n,
                 int64_t gemm_k,
                 int num_experts,
-                wintx::WintQuantMethod quant_method,
+                WintQuantMethod quant_method,
                 cudaStream_t stream);
 
  private:
@@ -68,7 +68,7 @@ class MoeGemmRunner {
                         int64_t gemm_n,
                         int64_t gemm_k,
                         int num_experts,
-                        wintx::WintQuantMethod quant_method,
+                        WintQuantMethod quant_method,
                         CutlassGemmConfig gemm_config,
                         cudaStream_t stream,
                         int* occupancy = nullptr);
@@ -84,7 +84,7 @@ class MoeGemmRunner {
                 int64_t gemm_n,
                 int64_t gemm_k,
                 int num_experts,
-                wintx::WintQuantMethod quant_method,
+                WintQuantMethod quant_method,
                 cudaStream_t stream);
 
  private:
