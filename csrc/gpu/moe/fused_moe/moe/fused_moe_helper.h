@@ -17,6 +17,7 @@ limitations under the License. */
 
 #include "cutlass_kernels/moe_gemm/fused_moe_gemm_kernels.h"
 #include "moe/fused_moe_op.h"
+#include "cutlass_kernels/moe_gemm/wint_type_traits.h"
 
 using namespace phi;
 
@@ -303,6 +304,7 @@ public:
           inter_size,
           hidden_size,
           num_experts,
+          WintQuantMethod::kWeightOnlyInt8,
           "none",
           stream);
     } else if (gemm_method_ == "weight_only_int4") {
@@ -318,6 +320,7 @@ public:
           inter_size,
           hidden_size,
           num_experts,
+          WintQuantMethod::kWeightOnlyInt4,
           "none",
           stream);
     } else {
@@ -332,6 +335,7 @@ public:
           inter_size,
           hidden_size,
           num_experts,
+          WintQuantMethod::kNone,
           "none",
           stream);
     }
@@ -356,6 +360,7 @@ public:
             hidden_size,
             inter_size / 2,
             num_experts,
+            WintQuantMethod::kWeightOnlyInt8,
             stream);
       } else if (gemm_method_ == "weight_only_int4") {
         int4_moe_gemm_runner_->moe_gemm(
@@ -369,6 +374,7 @@ public:
             hidden_size,
             inter_size / 2,
             num_experts,
+            WintQuantMethod::kWeightOnlyInt4,
             stream);
       } else {
         fp16_moe_gemm_runner_->moe_gemm(
@@ -381,6 +387,7 @@ public:
             hidden_size,
             inter_size / 2,
             num_experts,
+            WintQuantMethod::kNone,
             stream);
       }
 
